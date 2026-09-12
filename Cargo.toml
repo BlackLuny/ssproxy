@@ -1,0 +1,39 @@
+[package]
+name = "ssproxy"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance sans-IO SSH TCP-proxy daemon (password auth)"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.83"
+
+[lib]
+name = "ssproxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ssproxyd"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = { version = "0.10", features = ["aes"] }
+bytes = "1"
+chacha20 = "0.9"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "std"] }
+poly1305 = "0.8"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util", "process"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
