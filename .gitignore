@@ -3,3 +3,6 @@
 .host_key*
 /tmp-ssproxy*
 .ssproxy-host*
+ssproxy_host_ed25519
+ssproxy_host_ed25519.pub
+agent-tools/
