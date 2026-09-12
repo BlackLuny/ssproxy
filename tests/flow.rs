@@ -85,7 +85,6 @@ async fn concurrent_clients() {
 
     let mut joins = Vec::new();
     for i in 0..16 {
-        let echo = echo;
         joins.push(tokio::spawn(async move {
             let stream = TcpStream::connect(ssh_addr).await.unwrap();
             let mut c = ClientPump::new(stream, ClientConfig::new("proxy", "proxy"));

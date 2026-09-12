@@ -1475,7 +1475,7 @@ impl Connection {
         let kind = self.send_cipher.kind();
         let block = kind.block_size();
         let tag = kind.tag_len();
-        let pad = padding_len(payload.len(), block);
+        let pad = padding_len(payload.len(), block, kind.is_aead());
         let packet_length = 1 + payload.len() + pad;
         let total = 4 + packet_length + tag;
         let mut buf = BytesMut::with_capacity(total);
@@ -1507,6 +1507,7 @@ fn is_zero(b: &[u8]) -> bool {
     acc == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_h(
     v_c: &str,
     v_s: &str,

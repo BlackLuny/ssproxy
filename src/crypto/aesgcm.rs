@@ -5,6 +5,7 @@ use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use crate::crypto::CipherKind;
 use crate::error::{Error, Result};
 
+#[allow(clippy::large_enum_variant)]
 enum Inner {
     Aes128(Aes128Gcm),
     Aes256(Aes256Gcm),

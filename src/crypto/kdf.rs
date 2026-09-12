@@ -38,7 +38,7 @@ pub fn derive_keys(
     is_server: bool,
 ) -> DerivedKeys {
     let kl = cipher.key_len();
-    let il = cipher.iv_len().max(0);
+    let il = cipher.iv_len();
     // Always derive something so letter usage is stable even when iv_len==0.
     let iv_need = if il == 0 { 8 } else { il };
 

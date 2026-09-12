@@ -79,6 +79,7 @@ impl CipherKind {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum DirectionKeys {
     Clear,
     ChaCha(ChaCha20Poly1305Ssh),
@@ -216,8 +217,18 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-pub fn padding_len(payload_len: usize, block: usize) -> usize {
-    let need = 1 + payload_len;
+/// SSH packet padding.
+///
+/// RFC 4253: `length || padlen || payload || padding` is a multiple of
+/// `max(8, cipher_block)`. For AEAD (ChaCha/AES-GCM) the 4-byte length is
+/// AAD and is *not* included in that alignment — only `padlen||payload||pad`.
+pub fn padding_len(payload_len: usize, block: usize, length_is_aad: bool) -> usize {
+    let block = block.max(8);
+    let need = if length_is_aad {
+        1 + payload_len
+    } else {
+        4 + 1 + payload_len
+    };
     let mut pad = block - (need % block);
     if pad < 4 {
         pad += block;
@@ -231,8 +242,15 @@ mod tests {
 
     #[test]
     fn padding_min_four() {
-        assert_eq!(padding_len(7, 8), 8); // 1+7=8, pad would be 8 then already %8==0 -> 8 >= 4
-        assert_eq!(padding_len(0, 8), 7); // 1+0=1, pad=7
-        assert_eq!(padding_len(3, 8), 4); // 1+3=4, pad=4
+        // Cleartext: 4-byte length is inside the block alignment.
+        assert_eq!(padding_len(7, 8, false), 4); // 4+1+7=12, pad=4 → 16
+        assert_eq!(padding_len(0, 8, false), 11); // 5, pad=11 → 16
+        assert_eq!(padding_len(3, 8, false), 8); // 8, pad=8 → 16
+                                                 // AEAD: length is AAD, align padlen||payload||pad only.
+        assert_eq!(padding_len(7, 8, true), 8); // 1+7=8, pad=8
+        assert_eq!(padding_len(0, 8, true), 7); // 1, pad=7
+        assert_eq!(padding_len(3, 8, true), 4); // 4, pad=4
+        assert_eq!(padding_len(15, 16, true), 16); // 16, pad=16
+        assert_eq!(padding_len(14, 16, true), 17); // 15, pad=1<4 → 17
     }
 }

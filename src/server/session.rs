@@ -100,6 +100,7 @@ impl Session {
 
     fn poll_ssh_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
         let mut progress = false;
+        #[allow(clippy::while_let_loop)]
         loop {
             let Some(chunk) = self.conn.peek_out() else {
                 break;
@@ -207,6 +208,7 @@ impl Session {
     fn poll_dest_one(&mut self, cx: &mut Context<'_>, id: u32) -> Result<bool> {
         let mut progress = false;
         // inbound SSH -> dest write
+        #[allow(clippy::while_let_loop)]
         loop {
             let Some(chunk) = self.conn.peek_inbound(id).map(|s| s.to_vec()) else {
                 break;
@@ -215,22 +217,14 @@ impl Session {
                 Some(d) => d,
                 None => break,
             };
-            let Dest::Up {
-                stream,
-                write_shutdown,
-                ..
-            } = dest
-            else {
+            let Dest::Up { stream, .. } = dest else {
                 break;
             };
-            if *write_shutdown {
-                self.conn.consume_inbound(id, chunk.len());
-                progress = true;
-                continue;
-            }
             match Pin::new(stream).poll_write(cx, &chunk) {
                 Poll::Ready(Ok(0)) => {
-                    *write_shutdown = true;
+                    if let Some(Dest::Up { write_shutdown, .. }) = self.dests.get_mut(&id) {
+                        *write_shutdown = true;
+                    }
                     break;
                 }
                 Poll::Ready(Ok(n)) => {
@@ -290,11 +284,16 @@ impl Session {
             write_shutdown,
         }) = self.dests.get_mut(&id)
         {
-            if *write_shutdown {
+            let inbound_empty = self
+                .conn
+                .peek_inbound(id)
+                .map(|d| d.is_empty())
+                .unwrap_or(true);
+            if *write_shutdown && inbound_empty {
                 let _ = Pin::new(stream).poll_shutdown(cx);
             }
             let done = *read_eof && (*write_shutdown || self.conn.channel_got_eof(id));
-            if done {
+            if done && inbound_empty {
                 self.conn.send_close(id)?;
                 self.dests.remove(&id);
                 progress = true;

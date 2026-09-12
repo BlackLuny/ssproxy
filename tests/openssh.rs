@@ -4,7 +4,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use ssproxy::config::ServerConfig;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use common::{

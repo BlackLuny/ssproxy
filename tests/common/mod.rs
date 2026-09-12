@@ -125,6 +125,7 @@ impl ClientPump {
     fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
         let mut progress = false;
         let mut pending = false;
+        #[allow(clippy::while_let_loop)]
         loop {
             let Some(chunk) = self.conn.peek_out() else {
                 break;
@@ -174,6 +175,7 @@ impl ClientPump {
             progress = true;
             // Drain newly sealed packets before returning so WINDOW_ADJUST
             // produced by later consume_inbound cannot be observed first.
+            #[allow(clippy::while_let_loop)]
             loop {
                 let Some(chunk) = self.conn.peek_out() else {
                     break;
@@ -189,7 +191,7 @@ impl ClientPump {
                     Poll::Pending => break,
                 }
             }
-        } else if self.conn.read_buf_mut().len() > 0 {
+        } else if !self.conn.read_buf_mut().is_empty() {
             self.conn.process_in()?;
         }
         if pending && !progress {
@@ -442,7 +444,18 @@ pub async fn run_ssh_stdio(
     }
     let mut stdout = child.stdout.take().unwrap();
     let mut buf = vec![0u8; read_n];
-    stdout.read_exact(&mut buf).await.expect("ssh stdout");
-    let _ = child.kill().await;
-    buf
+    match stdout.read_exact(&mut buf).await {
+        Ok(_) => {
+            let _ = child.kill().await;
+            buf
+        }
+        Err(e) => {
+            let mut errb = Vec::new();
+            if let Some(mut es) = child.stderr.take() {
+                let _ = es.read_to_end(&mut errb).await;
+            }
+            let _ = child.kill().await;
+            panic!("ssh stdout: {e}; stderr={}", String::from_utf8_lossy(&errb));
+        }
+    }
 }
