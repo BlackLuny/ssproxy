@@ -105,6 +105,8 @@ async fn inbound_window_stall_frozen_victim_does_not_wedge_healthy() {
     let warmup = Instant::now() + Duration::from_millis(500);
     let deadline = Instant::now() + duration;
     let mut armed = false;
+    let mut victim_up_at_arm = 0u64;
+    let mut victim_up_parked: Option<u64> = None;
     let mut last_log = Instant::now();
     let (mut last_v, mut last_h) = (0u64, 0u64);
     let mut stalled: Option<(usize, u64)> = None;
@@ -173,9 +175,10 @@ async fn inbound_window_stall_frozen_victim_does_not_wedge_healthy() {
                 *t = now;
             }
             armed = true;
+            victim_up_at_arm = victim_up;
             eprintln!(
                 "stall monitor armed: victim_down={victim_down} victim_up={victim_up} \
-                 healthy_down={healthy_down}"
+                 healthy_down={healthy_down} (victim upstream should park once dest TCP fills)"
             );
         }
 
@@ -186,37 +189,53 @@ async fn inbound_window_stall_frozen_victim_does_not_wedge_healthy() {
             last_v = victim_down;
             last_h = healthy_down;
             let nowm = base.elapsed().as_millis() as u64;
-            let mut worst = (usize::MAX, 0u64);
+            let mut worst: Option<(usize, u64)> = None;
             if armed {
                 for (i, p) in last_progress_ms.iter().enumerate() {
                     if i == 0 {
                         continue;
                     }
                     let idle = nowm.saturating_sub(*p);
-                    if idle > worst.1 {
-                        worst = (i, idle);
+                    match worst {
+                        Some((_, w)) if idle <= w => {}
+                        _ => worst = Some((i, idle)),
                     }
                 }
             }
+            let (wch, widle) = worst.unwrap_or((0, 0));
+            if armed && victim_up_parked.is_none() && base.elapsed() >= Duration::from_secs(2) {
+                victim_up_parked = Some(victim_up);
+                eprintln!("victim upstream sample after 2s: {victim_up} bytes");
+            }
             eprintln!(
                 "repro: healthy={h_mbps:.2} MB/s victim_down={v_mbps:.2} MB/s \
-                 victim_up={} victim_down={victim_down} healthy_down={healthy_down}, \
-                 worst HEALTHY idle: chan#{} {} ms",
-                victim_up, worst.0, worst.1
+                 victim_up={victim_up} victim_down={victim_down} healthy_down={healthy_down}, \
+                 worst HEALTHY idle: chan#{wch} {widle} ms"
             );
-            if armed && worst.1 > stall_threshold.as_millis() as u64 {
-                stalled = Some(worst);
-                eprintln!(
-                    "STALL: healthy downstream-only channel #{} made no progress for {} ms \
-                     (healthy aggregate {h_mbps:.2} MB/s). A channel that sends NO upstream \
-                     can only stall via the shared session loop being wedged by the victim's \
-                     frozen upstream => cross-channel head-of-line blocking (RC2).",
-                    worst.0, worst.1
-                );
+            if armed {
+                if let Some(w) = worst {
+                    if w.1 > stall_threshold.as_millis() as u64 {
+                        stalled = Some(w);
+                        eprintln!(
+                            "STALL: healthy downstream-only channel #{} made no progress for {} ms \
+                             (healthy aggregate {h_mbps:.2} MB/s). A channel that sends NO upstream \
+                             can only stall via the shared session loop being wedged by the victim's \
+                             frozen upstream => cross-channel head-of-line blocking (RC2).",
+                            w.0, w.1
+                        );
+                    }
+                }
             }
         }
     }
 
+    let parked = victim_up_parked.unwrap_or(victim_up_at_arm);
+    let up_growth = victim_up.saturating_sub(parked);
+    assert!(
+        parked > 0 && up_growth < 64 * 1024,
+        "victim upstream did not park (sample={parked} end={victim_up} growth={up_growth}); \
+         freeze dest never filled, so this is not an RC2 repro"
+    );
     assert!(
         healthy_down > 1024 * 1024,
         "healthy channels transferred only {healthy_down} bytes; expected >1MiB downstream"
