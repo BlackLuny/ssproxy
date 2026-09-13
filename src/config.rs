@@ -116,7 +116,7 @@ impl Default for Config {
             ident: "SSH-2.0-OpenSSH_9.6".into(),
             algorithms: Algorithms::default(),
             max_packet: 32 * 1024,
-            window_initial: 1024 * 1024,
+            window_initial: 2 * 1024 * 1024,
             window_max: 16 * 1024 * 1024,
             window_budget: 64 * 1024 * 1024,
             max_channels: 4096,
