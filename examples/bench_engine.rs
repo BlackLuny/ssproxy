@@ -38,6 +38,11 @@ fn server_cfg() -> Arc<ServerConfig> {
     if let Some(n) = rekey_bytes() {
         cfg.base.rekey_bytes = n;
     }
+    if let Ok(v) = std::env::var("BENCH_RX_CAP") {
+        if let Ok(v) = v.parse::<usize>() {
+            cfg.base.channel_rx_cap = v;
+        }
+    }
     if let Ok(w) = std::env::var("BENCH_WINDOW") {
         if let Ok(w) = w.parse::<u32>() {
             if std::env::var_os("BENCH_MAX_ONLY").is_some() {
@@ -236,7 +241,7 @@ impl Client {
             // BENCH_SHALLOW=1 reproduces a client whose event loop parks on a
             // read as soon as its own output buffer fills — the shape that
             // matches the real-machine single-stream numbers.
-            if self.conn.send_capacity(id) == 0 || shallow() {
+            if sent < total && (self.conn.send_capacity(id) == 0 || shallow()) {
                 if let Err(e) = self.round().await {
                     stall(id, sent, total, e, &self.conn);
                 }

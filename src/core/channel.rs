@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use bytes::Bytes;
@@ -9,8 +10,8 @@ pub enum ChannelKind {
 }
 
 /// Per-channel protocol state. Byte buffers here are the *protocol* queues:
-/// `in_q` holds peer data not yet handed to the application; `pending_out`
-/// holds application data not yet sealed (blocked on window or rekey).
+/// `in_q` holds peer data not yet taken by the driver; `pending_out` holds
+/// application data not yet sealed (blocked on window or rekey).
 pub struct Channel {
     pub local_id: u32,
     pub remote_id: Option<u32>,
@@ -22,8 +23,14 @@ pub struct Channel {
     pub recv_max: u32,
     pub peer_max_packet: u32,
     pub local_max_packet: u32,
+    /// Peer bytes not yet handed out (`take_inbound` / `inbound_front`).
     pub in_q: VecDeque<Bytes>,
-    pub in_q_bytes: usize,
+    /// Bytes received from the peer that the application has not consumed
+    /// yet — the credit ledger's `Q + P` (`in_q`, plus everything handed out
+    /// but not yet reported back through `consume_credit`). Window credit is
+    /// re-offered from this, so handing a chunk to the application does not
+    /// by itself return any credit.
+    pub unacked: usize,
     pub pending_out: VecDeque<Bytes>,
     pub pending_out_bytes: usize,
     pub open_confirmed: bool,
@@ -35,6 +42,8 @@ pub struct Channel {
     pub wire_close: bool,
     pub host: Option<String>,
     pub port: u16,
+    /// Queued in the table's dirty list.
+    pub dirty: bool,
 }
 
 impl Channel {
@@ -55,7 +64,7 @@ impl Channel {
             peer_max_packet,
             local_max_packet,
             in_q: VecDeque::new(),
-            in_q_bytes: 0,
+            unacked: 0,
             pending_out: VecDeque::new(),
             pending_out_bytes: 0,
             open_confirmed: false,
@@ -67,20 +76,28 @@ impl Channel {
             wire_close: false,
             host: None,
             port: 0,
+            dirty: false,
         }
+    }
+
+    /// Window-adjust step: credit is offered back in units of this many
+    /// bytes (1/16 of the window). Small enough that a peer parked on a full
+    /// window resumes early; coarse enough that adjusts stay rare.
+    pub fn credit_step(&self) -> usize {
+        (self.recv_max / 16) as usize
     }
 
     /// Window-adjust increment to advertise, or 0 if not worth it yet.
     ///
-    /// Credit is restored to `recv_max - in_q_bytes`: everything the peer sent
-    /// that we have already handed to the application. That is replenishment,
-    /// not growth — `recv_max` is fixed when the channel opens — so it must not
-    /// be gated on any session-level allowance. Throttling it here (an earlier
+    /// Credit is restored to `recv_max - unacked`: everything the peer sent
+    /// that the application has consumed. That is replenishment, not growth —
+    /// `recv_max` is fixed when the channel opens — so it must not be gated on
+    /// any session-level allowance. Throttling it here (an earlier
     /// `min(recv_window + budget_room)` did exactly that) wedges the channel:
     /// once the window hits zero with an exhausted allowance, no adjust is ever
     /// produced again and the peer waits forever.
     pub fn window_adjust(&self) -> u32 {
-        let used = self.in_q_bytes as u32;
+        let used = self.unacked.min(u32::MAX as usize) as u32;
         let target = self.recv_max.saturating_sub(used);
         if target <= self.recv_window {
             return 0;
@@ -93,7 +110,8 @@ impl Channel {
         // window. Measured with such a peer, 64 KiB steps (1/16 of the default
         // 1 MiB window) nearly double single-stream throughput versus 256 KiB
         // steps; going finer than 1/16 buys nothing further.
-        if add >= self.recv_max / 16 || self.recv_window < self.recv_max / 16 {
+        let step = self.recv_max / 16;
+        if add >= step || self.recv_window < step {
             add
         } else {
             0
@@ -114,83 +132,70 @@ impl Channel {
     }
 }
 
-/// Slotted channel table with a free-list and a dirty set so the driver only
-/// revisits channels that have pending work.
+/// Channel table keyed by local id, with a dirty list so the driver only
+/// revisits channels that have protocol-side work.
+///
+/// Ids are handed out monotonically and never reused while the process runs
+/// (wrap-around at 2^32 skips live ids). A freed slot that were reused right
+/// away could be confused with its predecessor by a driver that still holds
+/// the old channel's application state: a CLOSE and a fresh OPEN can land in
+/// one read, before the driver has looked at either.
 pub struct ChannelTable {
-    slots: Vec<Option<Channel>>,
-    free: Vec<u32>,
+    map: HashMap<u32, Channel>,
+    next_id: u32,
     dirty: VecDeque<u32>,
-    dirty_set: Vec<bool>,
     max_channels: u32,
-    active: u32,
 }
 
 impl ChannelTable {
     pub fn new(max_channels: u32) -> Self {
         Self {
-            slots: Vec::new(),
-            free: Vec::new(),
+            map: HashMap::new(),
+            next_id: 0,
             dirty: VecDeque::new(),
-            dirty_set: Vec::new(),
             max_channels,
-            active: 0,
         }
     }
 
     pub fn active(&self) -> u32 {
-        self.active
+        self.map.len() as u32
     }
 
     pub fn is_full(&self) -> bool {
-        self.active >= self.max_channels
+        self.active() >= self.max_channels
     }
 
     pub fn alloc(&mut self, mut ch: Channel) -> Option<u32> {
         if self.is_full() {
             return None;
         }
-        let id = if let Some(id) = self.free.pop() {
-            id
-        } else {
-            let id = self.slots.len() as u32;
-            self.slots.push(None);
-            self.dirty_set.push(false);
-            id
-        };
+        let mut id = self.next_id;
+        while self.map.contains_key(&id) {
+            id = id.wrapping_add(1);
+        }
+        self.next_id = id.wrapping_add(1);
         ch.local_id = id;
-        self.slots[id as usize] = Some(ch);
-        self.active += 1;
+        self.map.insert(id, ch);
         self.mark(id);
         Some(id)
     }
 
     pub fn get(&self, id: u32) -> Option<&Channel> {
-        self.slots.get(id as usize).and_then(|c| c.as_ref())
+        self.map.get(&id)
     }
 
     pub fn get_mut(&mut self, id: u32) -> Option<&mut Channel> {
-        self.slots.get_mut(id as usize).and_then(|c| c.as_mut())
-    }
-
-    pub fn by_remote(&self, remote: u32) -> Option<u32> {
-        self.slots.iter().flatten().find_map(|c| {
-            (c.remote_id == Some(remote)).then_some(c.local_id)
-        })
+        self.map.get_mut(&id)
     }
 
     pub fn free(&mut self, id: u32) {
-        if let Some(slot) = self.slots.get_mut(id as usize) {
-            if slot.take().is_some() {
-                self.free.push(id);
-                self.active -= 1;
-            }
-        }
+        self.map.remove(&id);
     }
 
     pub fn mark(&mut self, id: u32) {
-        if let Some(d) = self.dirty_set.get_mut(id as usize) {
-            if !*d {
-                *d = true;
+        if let Some(ch) = self.map.get_mut(&id) {
+            if !ch.dirty {
+                ch.dirty = true;
                 self.dirty.push_back(id);
             }
         }
@@ -199,10 +204,8 @@ impl ChannelTable {
     /// Pop the next channel needing attention.
     pub fn next_dirty(&mut self) -> Option<u32> {
         while let Some(id) = self.dirty.pop_front() {
-            if let Some(d) = self.dirty_set.get_mut(id as usize) {
-                *d = false;
-            }
-            if self.get(id).is_some() {
+            if let Some(ch) = self.map.get_mut(&id) {
+                ch.dirty = false;
                 return Some(id);
             }
         }
@@ -210,6 +213,6 @@ impl ChannelTable {
     }
 
     pub fn ids(&self) -> Vec<u32> {
-        self.slots.iter().flatten().map(|c| c.local_id).collect()
+        self.map.keys().copied().collect()
     }
 }

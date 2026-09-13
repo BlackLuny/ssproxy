@@ -24,7 +24,10 @@ pub enum Role {
 /// these except channel data are low-frequency.
 #[derive(Debug)]
 pub enum Event {
-    /// First key exchange finished; transport is encrypted.
+    /// A key exchange started (the first one, or a rekey). The driver arms
+    /// its kex deadline on this.
+    KexStarted,
+    /// A key exchange finished (every one, not just the first).
     KexDone,
     /// Password attempt awaiting `resolve_auth`.
     AuthPassword { user: String, password: String },
@@ -101,7 +104,10 @@ pub struct Connection {
     ident_peer: Option<String>,
     ident_acc: Vec<u8>,
     ident_done: bool,
-    ident_out: Option<Bytes>,
+    /// Our identification line occupies `out[..ident_len]` until it has been
+    /// consumed; KEXINIT follows it (unless `early_kexinit` queued it already).
+    ident_len: usize,
+    ident_pending: bool,
 
     // Framing / transport.
     /// 每连接的用户态 CSPRNG，**只**用来填 SSH 包 padding。
@@ -116,9 +122,11 @@ pub struct Connection {
     recv_seq: u32,
     send_cipher: DirectionKeys,
     recv_cipher: DirectionKeys,
-    write_q: VecDeque<Bytes>,
-    current: Option<(Bytes, bool)>, // (bytes, is_ident)
-    write_bytes: usize,
+    /// Sealed output, contiguous: every packet is framed and encrypted in
+    /// place at the tail; the transport consumes from `out_pos`. One buffer,
+    /// no per-packet allocation, no second copy into a staging buffer.
+    out: Vec<u8>,
+    out_pos: usize,
 
     // Rekey accounting.
     bytes_since_kex: u64,
@@ -191,17 +199,17 @@ impl Connection {
             ident_peer: None,
             ident_acc: Vec::new(),
             ident_done: false,
-            ident_out: None,
+            ident_len: 0,
+            ident_pending: false,
             pad_rng: StdRng::from_entropy(),
-            read_buf: BytesMut::with_capacity(16 * 1024),
+            read_buf: BytesMut::new(),
             partial: None,
             send_seq: 0,
             recv_seq: 0,
             send_cipher: DirectionKeys::Clear,
             recv_cipher: DirectionKeys::Clear,
-            write_q: VecDeque::new(),
-            current: None,
-            write_bytes: 0,
+            out: Vec::new(),
+            out_pos: 0,
             bytes_since_kex: 0,
             strict_kex: false,
             peer_ext_info: false,
@@ -230,7 +238,9 @@ impl Connection {
 
     fn start(&mut self) {
         let line = format!("{}\r\n", self.ident_local);
-        self.ident_out = Some(Bytes::from(line.into_bytes()));
+        self.out.extend_from_slice(line.as_bytes());
+        self.ident_len = line.len();
+        self.ident_pending = true;
         if self.cfg.early_kexinit {
             let _ = self.start_kex();
         }
@@ -257,19 +267,47 @@ impl Connection {
         self.channels.active()
     }
     pub fn wants_write(&self) -> bool {
-        self.current.is_some()
-            || !self.write_q.is_empty()
-            || self.ident_out.as_ref().is_some_and(|b| !b.is_empty())
+        self.out_pos < self.out.len()
     }
     pub fn is_finished(&self) -> bool {
         self.closed && !self.wants_write()
     }
     pub fn queued_out_bytes(&self) -> usize {
-        self.write_bytes
+        self.out.len() - self.out_pos
+    }
+    /// Physical size of the output buffer (bytes retained, not just pending).
+    /// Bounded by `compact_out`; exposed for the regression test that pins it.
+    pub fn out_capacity(&self) -> usize {
+        self.out.capacity()
     }
     /// Stop reading the transport when true (write backlog too large).
     pub fn write_saturated(&self) -> bool {
-        self.write_bytes >= self.cfg.out_hard
+        self.queued_out_bytes() >= self.cfg.out_hard
+    }
+    /// Release buffer capacity an idle session does not need. Called by the
+    /// driver when nothing is in flight and no channel is open; the buffers
+    /// regrow on demand.
+    pub fn shrink_idle(&mut self) {
+        if self.out.is_empty() && self.out.capacity() > 0 {
+            self.out = Vec::new();
+        }
+        if self.read_buf.is_empty() && self.read_buf.capacity() > 0 {
+            self.read_buf = BytesMut::new();
+        }
+    }
+
+    /// Output soft limit: `send_capacity` is 0 while this much is queued.
+    pub fn out_soft(&self) -> usize {
+        self.cfg.out_soft
+    }
+    /// Channel data parked in the core (rekey / zero window / backlog).
+    pub fn has_pending_out(&self, id: u32) -> bool {
+        self.channels.get(id).is_some_and(|c| !c.pending_out.is_empty())
+    }
+
+    /// A key exchange is in flight (first or rekey).
+    pub fn kex_in_progress(&self) -> bool {
+        self.kex.is_some() || self.sent_kexinit
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {
@@ -278,44 +316,58 @@ impl Connection {
 
     // ── outbound framing ─────────────────────────────────────────────────────
 
-    pub fn peek_out(&mut self) -> Option<&[u8]> {
-        if self.current.as_ref().is_some_and(|(b, _)| b.is_empty()) {
-            self.current = None;
-        }
-        if self.current.is_none() {
-            if let Some(b) = self.ident_out.take() {
-                if !b.is_empty() {
-                    self.current = Some((b, true));
-                }
-            }
-        }
-        if self.current.is_none() {
-            if let Some(b) = self.write_q.pop_front() {
-                self.current = Some((b, false));
-            }
-        }
-        self.current.as_ref().map(|(b, _)| b.as_ref()).filter(|b| !b.is_empty())
+    /// Sealed bytes waiting for the transport (all of them, contiguous).
+    pub fn out_pending(&self) -> &[u8] {
+        &self.out[self.out_pos..]
     }
 
+    pub fn peek_out(&mut self) -> Option<&[u8]> {
+        if self.out_pos < self.out.len() {
+            Some(&self.out[self.out_pos..])
+        } else {
+            None
+        }
+    }
+
+    /// The transport accepted `n` bytes of `out_pending()`.
     pub fn consume_out(&mut self, n: usize) {
         if n == 0 {
             return;
         }
-        let Some((buf, is_ident)) = self.current.as_mut() else {
-            return;
-        };
-        let take = n.min(buf.len());
-        let was_ident = *is_ident;
-        if take == buf.len() {
-            self.current = None;
-        } else {
-            let _ = buf.split_to(take);
+        self.out_pos = (self.out_pos + n).min(self.out.len());
+        if self.out_pos == self.out.len() {
+            // Fully drained: keep the allocation, reset the cursor. O(1).
+            self.out.clear();
+            self.out_pos = 0;
         }
-        if !was_ident {
-            self.write_bytes = self.write_bytes.saturating_sub(take);
-        } else if self.current.is_none() && !self.sent_kexinit {
-            // Our identification line just went out; open with KEXINIT.
-            let _ = self.start_kex();
+        if self.ident_pending && (self.out_pos >= self.ident_len || self.out.is_empty()) {
+            self.ident_pending = false;
+            if !self.sent_kexinit {
+                // Our identification line just went out; open with KEXINIT.
+                let _ = self.start_kex();
+            }
+        }
+    }
+
+    /// Reclaim the consumed prefix of `out` before appending `need` bytes.
+    ///
+    /// Two triggers: the prefix is at least as large as what is still
+    /// pending (so the move costs at most one byte per byte already written,
+    /// amortised), or the append would not fit in the current allocation
+    /// (compact instead of growing). The second keeps the *capacity* bounded
+    /// by the pending maximum plus one frame — without it, a transport that
+    /// always takes a little less than we append lets the buffer grow without
+    /// bound while the pending byte count stays small.
+    #[inline]
+    fn compact_out(&mut self, need: usize) {
+        if self.out_pos == 0 {
+            return;
+        }
+        let pending = self.out.len() - self.out_pos;
+        if self.out_pos >= pending || self.out.len() + need > self.out.capacity() {
+            self.out.copy_within(self.out_pos.., 0);
+            self.out.truncate(pending);
+            self.out_pos = 0;
         }
     }
 
@@ -324,6 +376,17 @@ impl Connection {
             self.read_buf.reserve(16 * 1024);
         }
         &mut self.read_buf
+    }
+
+    /// Process transport bytes from a caller-owned buffer. The transport reads
+    /// straight into `buf` (no staging copy); whole frames are consumed from
+    /// its front and a trailing partial frame is left in place for the next
+    /// read to complete. Equivalent to `read_buf_mut()` + `process_in()`.
+    pub fn process_from(&mut self, buf: &mut BytesMut) -> Result<()> {
+        std::mem::swap(&mut self.read_buf, buf);
+        let r = self.process_in();
+        std::mem::swap(&mut self.read_buf, buf);
+        r
     }
 
     // ── inbound framing ──────────────────────────────────────────────────────
@@ -492,10 +555,14 @@ impl Connection {
         self.sent_newkeys = false;
         self.recv_newkeys = false;
         self.kex_blocks_app = true;
+        self.events.push_back(Event::KexStarted);
         self.queue(&ours)
     }
 
-    fn maybe_rekey(&mut self) {
+    /// Start a rekey if the byte budget since the last one is spent. Checked
+    /// on both inbound and outbound traffic (a one-way bulk transfer must not
+    /// escape it).
+    pub fn maybe_rekey(&mut self) {
         if self.role != Role::Server
             || !self.first_kex_done
             || self.kex.is_some()
@@ -739,9 +806,9 @@ impl Connection {
         self.pending_keys = None;
         self.sent_kexinit = false;
         self.bytes_since_kex = 0;
+        self.events.push_back(Event::KexDone);
         if !self.first_kex_done {
             self.first_kex_done = true;
-            self.events.push_back(Event::KexDone);
             if self.role == Role::Server && self.peer_ext_info {
                 self.send_ext_info()?;
             }
@@ -1062,10 +1129,17 @@ impl Connection {
         Ok(())
     }
 
+    /// Receive window for the next channel. Full-size while the session's
+    /// window budget has room; once it is spent every further channel gets
+    /// `window_floor` instead of being refused — a proxy client multiplexing
+    /// many connections over one session must keep opening channels (the
+    /// 33rd channel at 2 MiB × 64 MiB used to get RESOURCE_SHORTAGE).
+    /// Returns 0 only when the floor itself is 0.
     fn next_window(&self) -> u32 {
         let room = self.cfg.window_budget.saturating_sub(self.window_used);
         let per_channel = self.cfg.window_initial.min(self.cfg.window_max);
-        (per_channel as u64).min(room) as u32
+        let floor = self.cfg.window_floor.min(per_channel);
+        ((per_channel as u64).min(room) as u32).max(floor)
     }
 
     /// Confirm a channel the driver accepted.
@@ -1114,6 +1188,7 @@ impl Connection {
             ch.open_confirmed = true;
         }
         self.flush_channel(local);
+        self.channels.mark(local);
         self.events.push_back(Event::OpenConfirmed { local_id: local });
         Ok(())
     }
@@ -1140,6 +1215,7 @@ impl Connection {
             ch.send_window = ch.send_window.saturating_add(add);
         }
         self.flush_channel(local);
+        self.channels.mark(local);
         self.events.push_back(Event::ChannelWindow { local_id: local });
         Ok(())
     }
@@ -1159,8 +1235,9 @@ impl Connection {
                 return Err(Error::protocol("window exceeded"));
             }
             ch.recv_window -= dlen as u32;
-            ch.in_q_bytes += dlen;
+            ch.unacked += dlen;
             ch.in_q.push_back(data);
+            self.channels.mark(local);
             self.events.push_back(Event::ChannelData { local_id: local });
         }
         Ok(())
@@ -1178,8 +1255,9 @@ impl Connection {
                 return Err(Error::protocol("window exceeded"));
             }
             ch.recv_window -= dlen as u32;
-            ch.in_q_bytes += dlen;
+            ch.unacked += dlen;
             ch.in_q.push_back(data);
+            self.channels.mark(local);
             self.events.push_back(Event::ChannelData { local_id: local });
         }
         Ok(())
@@ -1192,6 +1270,7 @@ impl Connection {
         if let Some(ch) = self.channels.get_mut(local) {
             ch.got_eof = true;
         }
+        self.channels.mark(local);
         self.events.push_back(Event::ChannelEof { local_id: local });
         Ok(())
     }
@@ -1213,6 +1292,7 @@ impl Connection {
         } else {
             let _ = self.send_close(local);
         }
+        self.channels.mark(local);
         self.events.push_back(Event::ChannelClose { local_id: local });
         Ok(())
     }
@@ -1241,8 +1321,36 @@ impl Connection {
         self.channels.get(id).and_then(|c| c.in_q.front().map(|b| b.as_ref()))
     }
 
+    /// Whether any peer bytes are still queued for the application.
+    pub fn has_inbound(&self, id: u32) -> bool {
+        self.channels.get(id).is_some_and(|c| !c.in_q.is_empty())
+    }
+
+    /// Take ownership of the next inbound chunk. This moves the bytes out
+    /// without returning any window credit: the chunk still counts as
+    /// unconsumed until the application reports it via `consume_credit`.
+    pub fn take_inbound(&mut self, id: u32) -> Option<Bytes> {
+        self.channels.get_mut(id).and_then(|c| c.in_q.pop_front())
+    }
+
+    /// The application consumed `n` bytes previously handed out with
+    /// `take_inbound`. Re-offers window credit and releases the channel if it
+    /// was already closed and nothing remains.
+    pub fn consume_credit(&mut self, id: u32, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let Some(ch) = self.channels.get_mut(id) else {
+            return;
+        };
+        ch.unacked = ch.unacked.saturating_sub(n);
+        self.maybe_adjust_window(id);
+        self.finalize_channel(id);
+    }
+
+    /// Consume `n` bytes of the front chunk in place (core-only embedders).
     pub fn consume_inbound(&mut self, id: u32, n: usize) {
-        {
+        let take = {
             let Some(ch) = self.channels.get_mut(id) else {
                 return;
             };
@@ -1251,23 +1359,26 @@ impl Connection {
             };
             let take = n.min(front.len());
             if take == front.len() {
-                let b = ch.in_q.pop_front().unwrap();
-                ch.in_q_bytes -= b.len();
+                ch.in_q.pop_front();
             } else {
                 let _ = front.split_to(take);
-                ch.in_q_bytes -= take;
             }
-        }
-        self.maybe_adjust_window(id);
-        // Draining the last bytes of an already-closed channel releases it.
-        self.finalize_channel(id);
+            take
+        };
+        self.consume_credit(id, take);
+    }
+
+    /// Window-adjust step of a channel (1/16 of its window), for embedders
+    /// that batch consumption reports.
+    pub fn channel_credit_step(&self, id: u32) -> usize {
+        self.channels.get(id).map(|c| c.credit_step()).unwrap_or(0)
     }
 
     /// Discard peer bytes the application will never read (its stream is gone).
     pub fn discard_inbound(&mut self, id: u32) {
         if let Some(ch) = self.channels.get_mut(id) {
             ch.in_q.clear();
-            ch.in_q_bytes = 0;
+            ch.unacked = 0;
         }
         self.finalize_channel(id);
     }
@@ -1298,7 +1409,7 @@ impl Connection {
 
     /// How much application data we may hand to `send_data` right now.
     pub fn send_capacity(&self, id: u32) -> usize {
-        if self.write_bytes >= self.cfg.out_soft && !self.kex_blocks_app {
+        if self.queued_out_bytes() >= self.cfg.out_soft && !self.kex_blocks_app {
             return 0;
         }
         let Some(ch) = self.channels.get(id) else {
@@ -1310,6 +1421,11 @@ impl Connection {
         if self.kex_blocks_app {
             // During rekey we may buffer up to one packet per channel.
             return (self.cfg.max_packet as usize).saturating_sub(ch.pending_out_bytes);
+        }
+        if !ch.pending_out.is_empty() {
+            // Bytes parked earlier (rekey / zero window) go first: one FIFO
+            // per channel, nothing overtakes it. `flush_pending` drains it.
+            return 0;
         }
         (ch.send_window as usize).min(ch.peer_max_packet as usize)
     }
@@ -1328,6 +1444,9 @@ impl Connection {
             self.enqueue_out(id, &data[sent..sent + n])?;
             sent += n;
         }
+        if sent > 0 {
+            self.maybe_rekey();
+        }
         Ok(sent)
     }
 
@@ -1341,7 +1460,7 @@ impl Connection {
             };
             (
                 ch.remote_id,
-                ch.can_send() && !self.kex_blocks_app,
+                ch.can_send() && !self.kex_blocks_app && ch.pending_out.is_empty(),
                 ch.peer_max_packet,
                 ch.send_window,
             )
@@ -1392,7 +1511,7 @@ impl Connection {
                     ch.can_write(),
                 )
             };
-            if !can || remote.is_none() || window == 0 || len == 0 || self.write_bytes >= self.cfg.out_soft
+            if !can || remote.is_none() || window == 0 || len == 0 || self.queued_out_bytes() >= self.cfg.out_soft
             {
                 return;
             }
@@ -1527,7 +1646,7 @@ impl Connection {
         let done = self
             .channels
             .get(id)
-            .map(|c| c.got_close && c.wire_close && c.in_q.is_empty())
+            .map(|c| c.got_close && c.wire_close && c.in_q.is_empty() && c.unacked == 0)
             .unwrap_or(false);
         if done {
             let window = self.channels.get(id).map(|c| c.recv_max as u64).unwrap_or(0);
@@ -1549,7 +1668,7 @@ impl Connection {
         self.channels.next_dirty()
     }
 
-    /// Debug snapshot: (kex_blocks_app, needs_kex, send_window, pending_out, recv_window, in_q).
+    /// Debug snapshot: (kex_blocks_app, needs_kex, send_window, pending_out, recv_window, unacked).
     pub fn dbg_channel(&self, id: u32) -> (bool, bool, u32, usize, u32, usize) {
         let ch = self.channels.get(id);
         (
@@ -1558,7 +1677,7 @@ impl Connection {
             ch.map(|c| c.send_window).unwrap_or(0),
             ch.map(|c| c.pending_out_bytes).unwrap_or(0),
             ch.map(|c| c.recv_window).unwrap_or(0),
-            ch.map(|c| c.in_q_bytes).unwrap_or(0),
+            ch.map(|c| c.unacked).unwrap_or(0),
         )
     }
 
@@ -1608,9 +1727,10 @@ impl Connection {
         self.queue_parts(&[payload])
     }
 
-    /// Seal `parts` as one packet's payload. Callers that assemble a payload
-    /// from a header plus a body pass both slices and skip the intermediate
-    /// buffer — the sealed frame is the only allocation on the wire path.
+    /// Seal `parts` as one packet's payload, framed and encrypted in place at
+    /// the tail of `out`. Callers that assemble a payload from a header plus
+    /// a body pass both slices; the only copy on the wire path is
+    /// payload → frame.
     fn queue_parts(&mut self, parts: &[&[u8]]) -> Result<()> {
         let payload_len: usize = parts.iter().map(|p| p.len()).sum();
         if payload_len == 0 {
@@ -1622,32 +1742,50 @@ impl Connection {
         let pad = padding_len(payload_len, block, aad);
         let plen = 1 + payload_len + pad;
         let total = 4 + plen + tag;
-        // Every byte of the frame is written below — length, pad byte, payload,
-        // random padding, and then `seal` fills the tag and encrypts in place —
-        // so there is nothing to pre-zero. `BytesMut::zeroed` would memset a
-        // 32 KiB buffer per packet on a path measured at ~4.6 ns/byte.
-        let mut buf = BytesMut::with_capacity(total);
-        // SAFETY: capacity for exactly `total` was just reserved; the bytes are
-        // uninitialised and every one of them is overwritten before any read of
-        // the buffer (the writes below, then `seal`, which reads only what was
-        // written and overwrites the packet in place).
-        unsafe { buf.set_len(total) };
-        buf[..4].copy_from_slice(&(plen as u32).to_be_bytes());
-        buf[4] = pad as u8;
-        let mut off = 5;
-        for part in parts {
-            buf[off..off + part.len()].copy_from_slice(part);
-            off += part.len();
+
+        self.compact_out(total);
+        let start = self.out.len();
+        self.out.reserve(total);
+        {
+            // Write the frame into spare capacity without pre-zeroing the
+            // whole packet (a 32 KiB memset per packet on a ~4 ns/byte path).
+            // Every one of the `total` bytes is initialised here — length,
+            // pad byte, payload, random padding, and a zeroed tag slot that
+            // `seal` overwrites — before `set_len` exposes them.
+            let spare = &mut self.out.spare_capacity_mut()[..total];
+            init(&mut spare[..4], &(plen as u32).to_be_bytes());
+            spare[4].write(pad as u8);
+            let mut off = 5;
+            for part in parts {
+                init(&mut spare[off..off + part.len()], part);
+                off += part.len();
+            }
+            let mut padb = [0u8; 64];
+            self.pad_rng.fill_bytes(&mut padb[..pad]);
+            init(&mut spare[off..off + pad], &padb[..pad]);
+            off += pad;
+            for b in &mut spare[off..off + tag] {
+                b.write(0);
+            }
         }
-        self.pad_rng.fill_bytes(&mut buf[off..off + pad]);
-        let (pkt, tag_out) = buf.split_at_mut(4 + plen);
+        // SAFETY: the `total` bytes of spare capacity starting at `start` were
+        // all initialised just above.
+        unsafe { self.out.set_len(start + total) };
+        let frame = &mut self.out[start..];
+        let (pkt, tag_out) = frame.split_at_mut(4 + plen);
         self.send_cipher.seal(self.send_seq, pkt, tag_out)?;
         self.send_seq = self.send_seq.wrapping_add(1);
         self.bytes_since_kex += total as u64;
-        let frozen = buf.freeze();
-        self.write_bytes += frozen.len();
-        self.write_q.push_back(frozen);
         Ok(())
+    }
+}
+
+#[inline(always)]
+fn init(dst: &mut [std::mem::MaybeUninit<u8>], src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len());
+    // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`, and we only write.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr() as *mut u8, src.len());
     }
 }
 

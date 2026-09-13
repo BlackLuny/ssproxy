@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
@@ -17,7 +17,7 @@ use crate::config::ServerConfig;
 use crate::core::conn::{Connection, Event};
 use crate::error::{Error, Result};
 use crate::proto::SSH_DISCONNECT_BY_APPLICATION;
-use crate::stream::{ChanShared, ChannelStream};
+use crate::stream::{ChanShared, ChannelStream, ReadyList};
 
 /// Verdict for an authentication attempt. `Reject{delay}` sleeps before the
 /// failure is sent (timing-attack / brute-force jitter), without blocking the
@@ -120,6 +120,34 @@ impl Deadline {
     }
 }
 
+/// Spare capacity kept available in the read buffer; one `read` fills up to
+/// the whole spare, so this is also the read batch size.
+const READ_CHUNK: usize = 32 * 1024;
+
+/// Application state of every live channel, keyed by the core's local id.
+/// Dropping it — however the driver exits: clean close, error, timeout,
+/// cancellation, or the future being dropped mid-await — terminates every
+/// stream so no reader or writer is left pending forever.
+#[derive(Default)]
+struct Chans {
+    map: HashMap<u32, Arc<Mutex<ChanShared>>>,
+    clean: bool,
+    /// Channels that still had application data when the output soft limit
+    /// stopped them. Nothing on the channel itself changes when the socket
+    /// drains, so they are revisited from here once there is room again;
+    /// without this a channel parked by the backlog waits for an unrelated
+    /// event (a WINDOW_ADJUST, more writes) to be looked at.
+    out_blocked: Vec<u32>,
+}
+
+impl Drop for Chans {
+    fn drop(&mut self) {
+        for sh in self.map.values() {
+            sh.lock().terminate(self.clean);
+        }
+    }
+}
+
 /// Drive one accepted SSH server connection to completion.
 ///
 /// Returns `Ok(())` on a clean close (peer disconnect, shutdown, idle timeout).
@@ -148,22 +176,19 @@ where
 {
     let base = cfg.base.clone();
     let mut conn = Connection::server(cfg);
-    let driver_notify = handle.notify.clone();
-    let mut chans: HashMap<u32, Arc<Mutex<ChanShared>>> = HashMap::new();
-    let mut read_buf = vec![0u8; 32 * 1024];
+    let ready = Arc::new(ReadyList::new(handle.notify.clone()));
+    let mut chans = Chans::default();
+    // Transport bytes land here directly; the core consumes whole frames from
+    // the front. Grown lazily: an idle session holds no read buffer.
+    let mut inbuf = BytesMut::new();
 
     // Split so reads and writes interleave: a blocking full flush before every
     // read would deadlock against a peer doing the same on a full socket buffer.
     let (mut rd, mut wr) = tokio::io::split(io);
-    // Sealed output waiting for the socket. Drained from `conn` each iteration;
-    // its size, plus what `conn` still holds, is the write backpressure signal.
-    // A plain `Vec` with a cursor, not a `BytesMut`: advancing a `BytesMut` gives
-    // up the capacity in front of the cursor, so a drained buffer reallocates on
-    // the next fill — 256 KiB of malloc/free per loop pass, for nothing. Grown
-    // on demand: an idle session must not sit on a 256 KiB staging buffer.
-    let mut out: Vec<u8> = Vec::new();
-    let mut out_pos: usize = 0;
-    const OUT_CAP: usize = 256 * 1024;
+    // A write happened since the last flush. Flushed only when there is
+    // nothing left to write, so a buffering transport sees the batch, not
+    // every packet.
+    let mut need_flush = false;
 
     // Pending rejected-auth timer: (fire time). When it elapses we send FAILURE.
     let mut auth_reject_at: Option<Instant> = None;
@@ -172,6 +197,7 @@ where
     let mut auth_dl = Deadline::new();
     let mut idle_dl = Deadline::new();
     let mut keepalive_dl = Deadline::new();
+    let mut rekey_dl = Deadline::new();
     let now = Instant::now();
     kex_dl.arm(now, Some(base.kex_timeout));
     auth_dl.arm(now, base.auth_timeout);
@@ -183,7 +209,13 @@ where
         // 1. Handle protocol events (auth hooks, channel opens, closes).
         while let Some(ev) = conn.pop_event() {
             match ev {
-                Event::KexDone => kex_dl.disarm(),
+                // Every exchange — first and each rekey — runs under the kex
+                // deadline; a stalled rekey is as dead as a stalled handshake.
+                Event::KexStarted => kex_dl.arm(Instant::now(), Some(base.kex_timeout)),
+                Event::KexDone => {
+                    kex_dl.disarm();
+                    rekey_dl.arm(Instant::now(), base.rekey_interval);
+                }
                 Event::AuthPassword { user, password } => {
                     match (hooks.auth_password)(&user, &password) {
                         AuthOutcome::Accept => conn.resolve_auth(true)?,
@@ -216,10 +248,12 @@ where
                     match (hooks.open)(&user, &host, port) {
                         OpenOutcome::Accept => {
                             let shared = Arc::new(Mutex::new(ChanShared::new(
+                                local_id,
                                 base.channel_tx_cap,
-                                driver_notify.clone(),
+                                base.channel_rx_cap,
+                                ready.clone(),
                             )));
-                            chans.insert(local_id, shared.clone());
+                            chans.map.insert(local_id, shared.clone());
                             conn.accept_channel(local_id)?;
                             idle_dl.disarm();
                             let _ = incoming.send(IncomingChannel {
@@ -239,10 +273,10 @@ where
                     conn.accept_channel(local_id)?;
                 }
                 Event::ChannelEof { local_id: _ } => {
-                    // Surfaced by `pump_channels`, which raises EOF only after
-                    // the bytes received before it have been handed over.
+                    // Surfaced by `pump_one`, which raises EOF only after the
+                    // bytes received before it have been handed over.
                 }
-                Event::ChannelClose { local_id } => match chans.get(&local_id) {
+                Event::ChannelClose { local_id } => match chans.map.get(&local_id) {
                     Some(sh) => {
                         let mut s = sh.lock();
                         s.closed = true; // peer accepts no more; reads still drain
@@ -258,40 +292,45 @@ where
             }
         }
 
-        // 2. Shuttle bytes between channel streams and the connection.
-        pump_channels(&mut conn, &mut chans);
+        // 2. Shuttle bytes for every channel with work: those the core marked
+        //    (data, window, eof, close arrived), those the application
+        //    signalled (wrote, consumed, shut down, dropped), and those the
+        //    output backlog stopped last time, now that it has drained.
+        //    Idle channels cost nothing here.
+        if !chans.out_blocked.is_empty() && conn.queued_out_bytes() < base.out_soft {
+            for id in std::mem::take(&mut chans.out_blocked) {
+                if let Some(sh) = chans.map.get(&id) {
+                    sh.lock().out_blocked = false;
+                }
+                pump_one(&mut conn, &mut chans, id);
+            }
+        }
+        for id in ready.take() {
+            pump_one(&mut conn, &mut chans, id);
+        }
+        while let Some(id) = conn.next_dirty() {
+            pump_one(&mut conn, &mut chans, id);
+        }
 
         // 3. Rearm idle timer when the last channel goes away.
         if conn.authed() && conn.active_channels() == 0 && idle_dl.at.is_none() {
             idle_dl.arm(Instant::now(), base.idle_timeout);
         }
 
-        // 4. Move sealed output out of `conn` into the local buffer (bounded so
-        //    `conn`'s own backlog keeps signalling backpressure). `clear()` — not
-        //    `BytesMut::advance` — is what keeps the 256 KiB allocation reusable.
-        if out_pos == out.len() {
-            out.clear();
-            out_pos = 0;
-        }
-        while out.len() - out_pos < OUT_CAP {
-            let Some(chunk) = conn.peek_out() else { break };
-            let take = chunk.len().min(OUT_CAP - (out.len() - out_pos));
-            out.extend_from_slice(&chunk[..take]);
-            conn.consume_out(take);
-        }
-
-        if conn.is_finished() && out_pos == out.len() {
+        if conn.is_finished() {
+            chans.clean = true;
             return Ok(());
         }
         if handle.cancel.load(Ordering::SeqCst) {
             conn.disconnect(SSH_DISCONNECT_BY_APPLICATION, "server shutting down");
-            drain_out(&mut wr, &mut conn, &mut out, &mut out_pos, base.linger).await;
+            drain_out(&mut wr, &mut conn, base.linger).await;
+            chans.clean = true;
             return Ok(());
         }
 
-        // 5. Compute the next deadline and wait for progress. Reads, writes and
+        // 4. Compute the next deadline and wait for progress. Reads, writes and
         //    timers race so neither direction can wedge the other.
-        let next = [kex_dl.at, auth_dl.at, idle_dl.at, keepalive_dl.at, auth_reject_at]
+        let next = [kex_dl.at, auth_dl.at, idle_dl.at, keepalive_dl.at, rekey_dl.at, auth_reject_at]
             .into_iter()
             .flatten()
             .min();
@@ -307,14 +346,15 @@ where
         }
         if debug_tick() {
             let mut line = String::new();
-            for (&id, sh) in chans.iter() {
+            for (&id, sh) in chans.map.iter() {
                 let s = sh.lock();
-                let (kex_block, needs_kex, send_wnd, pending, recv_wnd, in_q) = conn.dbg_channel(id);
+                let (kex_block, needs_kex, send_wnd, pending, recv_wnd, unacked) = conn.dbg_channel(id);
                 line.push_str(&format!(
-                    "  ch{id} app: to_app={} from_app={} eof={} fin={} drop={} closed={} \
+                    "  ch{id} app: to_app={} starved={} from_app={} eof={} fin={} drop={} closed={} \
                      | kex={kex_block} needs={needs_kex} send_wnd={send_wnd} pending={pending} \
-                     recv_wnd={recv_wnd} in_q={in_q}\n",
-                    s.to_app.len(),
+                     recv_wnd={recv_wnd} unacked={unacked}\n",
+                    s.to_app_bytes,
+                    s.starved,
                     s.from_app.len(),
                     s.to_app_eof,
                     s.from_app_fin,
@@ -322,33 +362,51 @@ where
                     s.closed,
                 ));
             }
-            eprintln!("[drv] out={} queued={}\n{}", out.len(), conn.queued_out_bytes(), line);
+            eprintln!("[drv] out={} inbuf={}\n{}", conn.queued_out_bytes(), inbuf.len(), line);
         }
 
         // Stop reading while our unwritten output is already large.
-        let read_allowed = (out.len() - out_pos) + conn.queued_out_bytes() < base.out_hard;
-        let want_write = out_pos < out.len();
+        let read_allowed = !conn.write_saturated();
+        let want_write = conn.wants_write();
+        let want_flush = !want_write && need_flush;
+        if read_allowed {
+            if inbuf.capacity() - inbuf.len() < READ_CHUNK {
+                inbuf.reserve(READ_CHUNK);
+            }
+        } else if inbuf.is_empty() {
+            inbuf = BytesMut::new();
+        }
+        // An idle session (no channels, nothing in flight) keeps no buffers.
+        if !want_write && conn.active_channels() == 0 {
+            conn.shrink_idle();
+        }
 
         tokio::select! {
             _ = handle.notify.notified() => {}
-            n = wr.write(&out[out_pos..]), if want_write => match n {
-                Ok(0) => return finish(conn, Error::Closed),
-                Ok(n) => { out_pos += n; }
-                Err(e) => return finish(conn, e.into()),
+            r = write_or_flush(&mut wr, conn.out_pending(), want_write), if want_write || want_flush => match r {
+                Ok(Io::Wrote(0)) => return finish(conn, &mut chans, Error::Closed),
+                Ok(Io::Wrote(n)) => {
+                    conn.consume_out(n);
+                    need_flush = true;
+                }
+                Ok(Io::Flushed) => need_flush = false,
+                Err(e) => return finish(conn, &mut chans, e.into()),
             },
             _ = &mut timer => {
                 let now = Instant::now();
                 if fired(&mut kex_dl, now) {
-                    return finish(conn, Error::TimedOut("kex"));
+                    return finish(conn, &mut chans, Error::TimedOut("kex"));
                 }
                 if fired(&mut auth_dl, now) {
                     conn.disconnect(SSH_DISCONNECT_BY_APPLICATION, "authentication timeout");
-                    drain_out(&mut wr, &mut conn, &mut out, &mut out_pos, base.linger).await;
+                    drain_out(&mut wr, &mut conn, base.linger).await;
+                    chans.clean = true;
                     return Ok(());
                 }
                 if fired(&mut idle_dl, now) {
                     conn.disconnect(SSH_DISCONNECT_BY_APPLICATION, "idle timeout");
-                    drain_out(&mut wr, &mut conn, &mut out, &mut out_pos, base.linger).await;
+                    drain_out(&mut wr, &mut conn, base.linger).await;
+                    chans.clean = true;
                     return Ok(());
                 }
                 if let Some(at) = auth_reject_at {
@@ -360,27 +418,54 @@ where
                 if fired(&mut keepalive_dl, now) {
                     match conn.send_keepalive() {
                         Ok(true) => keepalive_dl.arm(now, base.keepalive_interval),
-                        Ok(false) => return finish(conn, Error::TimedOut("keepalive")),
-                        Err(e) => return finish(conn, e),
+                        Ok(false) => return finish(conn, &mut chans, Error::TimedOut("keepalive")),
+                        Err(e) => return finish(conn, &mut chans, e),
                     }
                 }
+                if fired(&mut rekey_dl, now) {
+                    // Time-based rekey. Re-armed on the KexDone it produces;
+                    // armed again here too in case the exchange could not
+                    // start right now (one already running).
+                    if let Err(e) = conn.trigger_rekey() {
+                        return finish(conn, &mut chans, e);
+                    }
+                    rekey_dl.arm(now, base.rekey_interval);
+                }
             }
-            r = rd.read(&mut read_buf), if read_allowed => match r {
-                Ok(0) => return finish(conn, Error::Closed),
-                Ok(n) => {
-                    conn.read_buf_mut().extend_from_slice(&read_buf[..n]);
-                    if let Err(e) = conn.process_in() {
+            r = rd.read_buf(&mut inbuf), if read_allowed => match r {
+                Ok(0) => return finish(conn, &mut chans, Error::Closed),
+                Ok(_) => {
+                    if let Err(e) = conn.process_from(&mut inbuf) {
                         if !e.is_benign() {
-                            return finish(conn, e);
+                            return finish(conn, &mut chans, e);
                         }
                     }
                     if conn.authed() {
                         keepalive_dl.arm(Instant::now(), base.keepalive_interval);
                     }
                 }
-                Err(e) => return finish(conn, e.into()),
+                Err(e) => return finish(conn, &mut chans, e.into()),
             },
         }
+    }
+}
+
+enum Io {
+    Wrote(usize),
+    Flushed,
+}
+
+/// One branch for the write half: write what is pending, or — when nothing
+/// is — flush, so a buffering transport gets pushed before we wait.
+async fn write_or_flush<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    pending: &[u8],
+    want_write: bool,
+) -> std::io::Result<Io> {
+    if want_write {
+        wr.write(pending).await.map(Io::Wrote)
+    } else {
+        wr.flush().await.map(|_| Io::Flushed)
     }
 }
 
@@ -407,8 +492,11 @@ fn schedule_reject(
     }
 }
 
-fn finish(conn: Connection, e: Error) -> Result<()> {
+fn finish(conn: Connection, chans: &mut Chans, e: Error) -> Result<()> {
     if e.is_benign() || conn.is_closed() {
+        // The peer said goodbye (or we did): every queued byte is real, the
+        // streams end with EOF once drained.
+        chans.clean = conn.is_closed();
         Ok(())
     } else {
         Err(e)
@@ -416,111 +504,130 @@ fn finish(conn: Connection, e: Error) -> Result<()> {
 }
 
 /// Best-effort flush of leftover + queued output within `linger` (used on close).
-async fn drain_out<W: AsyncWrite + Unpin>(
-    wr: &mut W,
-    conn: &mut Connection,
-    out: &mut Vec<u8>,
-    out_pos: &mut usize,
-    linger: Duration,
-) {
+async fn drain_out<W: AsyncWrite + Unpin>(wr: &mut W, conn: &mut Connection, linger: Duration) {
     let deadline = Instant::now() + linger;
-    while !conn.is_finished() || *out_pos < out.len() {
-        if *out_pos == out.len() {
-            out.clear();
-            *out_pos = 0;
-        }
-        while out.len() - *out_pos < 64 * 1024 {
-            let Some(chunk) = conn.peek_out() else { break };
-            let n = chunk.len();
-            out.extend_from_slice(chunk);
-            conn.consume_out(n);
-        }
-        if *out_pos == out.len() {
-            break;
-        }
-        let pending = out.len() - *out_pos;
-        match tokio::time::timeout_at(deadline, wr.write(&out[*out_pos..])).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => {
-                *out_pos += n;
-                debug_assert!(n <= pending);
-            }
+    while conn.wants_write() {
+        let r = tokio::time::timeout_at(deadline, wr.write(conn.out_pending())).await;
+        match r {
+            Ok(Ok(n)) if n > 0 => conn.consume_out(n),
+            _ => break,
         }
     }
     let _ = tokio::time::timeout_at(deadline, wr.flush()).await;
 }
 
-/// Move bytes both directions for every channel with pending work.
-fn pump_channels(conn: &mut Connection, chans: &mut HashMap<u32, Arc<Mutex<ChanShared>>>) {
-    let mut gone = Vec::new();
-    // Visit only channels with protocol-side activity plus any with app-side
-    // buffers to service. We iterate the map (bounded by max_channels).
-    for (&id, shared) in chans.iter() {
-        if !conn.channel_alive(id) {
-            let mut s = shared.lock();
-            s.closed = true;
-            s.to_app_eof = true;
-            s.wake_reader();
-            s.wake_writer();
-            gone.push(id);
-            continue;
-        }
-        let mut s = shared.lock();
-
-        // peer -> app (bounded by tx_cap so a slow reader backpressures window)
-        if !s.dropped {
-            loop {
-                if s.to_app.len() >= s.tx_cap {
-                    break;
-                }
-                let Some(front) = conn.inbound_front(id) else { break };
-                let room = s.tx_cap - s.to_app.len();
-                let take = front.len().min(room);
-                s.to_app.extend_from_slice(&front[..take]);
-                conn.consume_inbound(id, take);
-                s.wake_reader();
-            }
-            if conn.channel_got_eof(id) && conn.inbound_front(id).is_none() {
-                s.to_app_eof = true;
-                s.wake_reader();
-            }
-        }
-
-        // app -> peer
-        while !s.from_app.is_empty() {
-            let cap = conn.send_capacity(id);
-            if cap == 0 {
-                break;
-            }
-            let take = s.from_app.len().min(cap);
-            let n = match conn.send_data(id, &s.from_app[..take]) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if n == 0 {
-                break;
-            }
-            s.from_app.advance(n);
-            s.wake_writer();
-        }
-
-        // Data the connection buffered while a key exchange blocked it. Only
-        // the driver can retry this once the socket has drained.
-        conn.flush_pending(id);
-
-        // Half-close / close propagation.
-        if s.from_app.is_empty() && s.from_app_fin {
-            let _ = conn.send_eof(id);
-        }
-        // CLOSE only once everything the app wrote has reached the connection:
-        // a CLOSE strands whatever is still sitting in `from_app` (the channel
-        // refuses further data after `sent_close`).
-        if s.dropped && s.from_app.is_empty() {
-            let _ = conn.send_close(id);
+/// Move bytes both directions for one channel.
+///
+/// The channel lock is held only to swap owned data and flags in and out;
+/// framing and encryption (`send_data`) run outside it, so a relay writer is
+/// never parked behind the cipher.
+fn pump_one(conn: &mut Connection, chans: &mut Chans, id: u32) {
+    let Some(shared) = chans.map.get(&id).cloned() else {
+        // No stream for this channel (a `session` channel, or one the
+        // application never got): nothing will read what the peer sends.
+        if conn.channel_alive(id) && conn.has_inbound(id) {
             conn.discard_inbound(id);
         }
+        return;
+    };
+    if !conn.channel_alive(id) {
+        shared.lock().terminate(true);
+        chans.map.remove(&id);
+        return;
     }
-    for id in gone {
-        chans.remove(&id);
+
+    // ── in the lock: swap ───────────────────────────────────────────────────
+    let (credited, mut data, fin, dropped) = {
+        let mut s = shared.lock();
+        s.queued = false;
+        // peer -> app: move chunks in while the app queue has room. Credit
+        // for them is returned to the peer right here (see `stream.rs` for
+        // why not at consumption); what does not fit stays in the core,
+        // un-credited, and the reader asks for a refill when it has room.
+        let mut credited = 0usize;
+        if !s.dropped {
+            let mut moved = false;
+            while s.to_app_bytes < s.rx_cap {
+                let Some(b) = conn.take_inbound(id) else { break };
+                s.to_app_bytes += b.len();
+                credited += b.len();
+                s.to_app.push_back(b);
+                moved = true;
+            }
+            s.starved = conn.has_inbound(id);
+            if conn.channel_got_eof(id) && !conn.has_inbound(id) && !s.to_app_eof {
+                s.to_app_eof = true;
+                moved = true;
+            }
+            if moved {
+                s.wake_reader();
+            }
+        }
+        (
+            credited,
+            std::mem::take(&mut s.from_app),
+            s.from_app_fin,
+            s.dropped,
+        )
+    };
+
+    // ── outside the lock: protocol work ─────────────────────────────────────
+    if credited > 0 {
+        conn.consume_credit(id, credited);
+    }
+    if dropped {
+        // Nobody will read these; free the window they hold.
+        conn.discard_inbound(id);
+    }
+    // Bytes parked behind a rekey / zero window go out first (one FIFO per
+    // channel), then whatever the application wrote since.
+    conn.flush_pending(id);
+    if !data.is_empty() {
+        let sent = conn.send_data(id, &data).unwrap_or(0);
+        if sent == data.len() {
+            data.clear(); // keeps the allocation for the next batch
+        } else {
+            data.advance(sent);
+        }
+    }
+    // Stopped by the output backlog (not by the peer's window, which comes
+    // back as a WINDOW_ADJUST and marks the channel): revisit when it drains.
+    let backlog_blocked = (!data.is_empty() || conn.has_pending_out(id))
+        && conn.queued_out_bytes() >= conn.out_soft();
+
+    // ── in the lock again: return what is left, wake the writer ─────────────
+    let from_app_empty = {
+        let mut s = shared.lock();
+        if s.from_app.is_empty() {
+            // Nothing arrived meanwhile: hand the buffer (and its capacity)
+            // back, with any unsent tail still at the front.
+            s.from_app = data;
+        } else if !data.is_empty() {
+            // The writer appended while we were sealing; our tail precedes it.
+            data.extend_from_slice(&s.from_app);
+            s.from_app = data;
+        }
+        if s.from_app.len() < s.tx_cap {
+            s.wake_writer();
+        }
+        if backlog_blocked && !s.out_blocked {
+            s.out_blocked = true;
+            chans.out_blocked.push(id);
+        }
+        s.from_app.is_empty()
+    };
+
+    // Half-close / close propagation.
+    if from_app_empty && fin {
+        let _ = conn.send_eof(id);
+    }
+    // CLOSE only once everything the app wrote has reached the connection:
+    // a CLOSE strands whatever is still sitting in `from_app` (the channel
+    // refuses further data after `sent_close`).
+    if dropped && from_app_empty {
+        let _ = conn.send_close(id);
+        if !conn.channel_alive(id) {
+            chans.map.remove(&id);
+        }
     }
 }

@@ -81,11 +81,26 @@ pub struct Config {
     /// window credit is replenished, never grown, so this is a hard cap on the
     /// bytes one channel may keep in flight.
     pub window_max: u32,
-    /// Sum of all channel windows in one session may not exceed this.
+    /// Sum of full-size channel windows in one session. Channels opened past
+    /// it get `window_floor` instead of being refused.
     pub window_budget: u64,
+    /// Receive window for channels opened once `window_budget` is spent. A
+    /// proxy client multiplexes many connections over one session; refusing
+    /// its 33rd channel (64 MiB / 2 MiB) is a functional regression, a small
+    /// window is not. 0 restores the old refuse-on-exhaustion behaviour.
+    pub window_floor: u32,
     pub max_channels: u32,
-    /// Bytes a `ChannelStream` writer may buffer before `poll_write` pends.
+    /// Bytes a `ChannelStream` writer may buffer before `poll_write` pends
+    /// (application → peer).
     pub channel_tx_cap: usize,
+    /// Peer → application queue cap per channel. Chunks moved into it have
+    /// their window credit returned to the peer, so this is how far the peer
+    /// may run ahead of the application on top of the receive window; the
+    /// memory commitment per channel is `window + channel_rx_cap` (+ one
+    /// chunk). Too small and single-stream throughput drops (every refill
+    /// waits on the reader task); too large and a stalled destination pins
+    /// that much per channel.
+    pub channel_rx_cap: usize,
     /// Stop sealing channel data while this many bytes wait for the socket.
     pub out_soft: usize,
     /// Stop reading from the peer while this many bytes wait for the socket.
@@ -119,8 +134,10 @@ impl Default for Config {
             window_initial: 2 * 1024 * 1024,
             window_max: 16 * 1024 * 1024,
             window_budget: 64 * 1024 * 1024,
+            window_floor: 256 * 1024,
             max_channels: 4096,
             channel_tx_cap: 64 * 1024,
+            channel_rx_cap: 256 * 1024,
             out_soft: 256 * 1024,
             out_hard: 4 * 1024 * 1024,
             rekey_bytes: 1 << 30,
