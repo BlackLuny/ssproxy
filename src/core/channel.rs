@@ -201,15 +201,15 @@ impl ChannelTable {
         }
     }
 
-    /// Pop the next channel needing attention.
+    /// Pop the next channel needing attention. Freed ids are still returned
+    /// so the driver can drop the matching application state; `pump_one`
+    /// treats a missing core slot as "remove from the map".
     pub fn next_dirty(&mut self) -> Option<u32> {
-        while let Some(id) = self.dirty.pop_front() {
-            if let Some(ch) = self.map.get_mut(&id) {
-                ch.dirty = false;
-                return Some(id);
-            }
+        let id = self.dirty.pop_front()?;
+        if let Some(ch) = self.map.get_mut(&id) {
+            ch.dirty = false;
         }
-        None
+        Some(id)
     }
 
     pub fn ids(&self) -> Vec<u32> {

@@ -118,13 +118,17 @@ async fn main() {
 async fn relay(ch: driver::IncomingChannel) {
     let target = format!("{}:{}", ch.host, ch.port);
     let mut stream = ch.stream;
-    match TcpStream::connect(&target).await {
-        Ok(mut up) => {
+    match tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(&target)).await {
+        Ok(Ok(mut up)) => {
             let _ = up.set_nodelay(true);
             let _ = copy_bidirectional(&mut stream, &mut up).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::debug!("connect {target}: {e}");
+            let _ = stream.shutdown().await;
+        }
+        Err(_) => {
+            log::debug!("connect {target}: timed out");
             let _ = stream.shutdown().await;
         }
     }

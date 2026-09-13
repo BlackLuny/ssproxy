@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use ssproxy::config::{ClientConfig, ServerConfig};
 use ssproxy::core::{Connection, Event};
-use ssproxy::driver::{self, IncomingChannel};
+use ssproxy::driver::{self, IncomingChannel, SessionHandle};
 use ssproxy::hostkey::HostKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
@@ -148,6 +148,95 @@ async fn large_tail_with_rx_cap(rx_cap: usize) {
     };
     assert_eq!(got.len(), TOTAL, "tail lost before EOF (rx_cap={rx_cap})");
     assert_eq!(got, payload);
+}
+
+/// An empty channel that the peer CLOSEs must wake a pending reader with EOF
+/// and drop the driver's map entry. Previously the driver skipped a core slot
+/// that was already freed, so the shared state leaked until the session ended
+/// and the reader waited forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_close_on_idle_channel_yields_eof() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (tx, mut rx) = mpsc::unbounded_channel::<IncomingChannel>();
+    let handle = SessionHandle::new();
+    let (done_tx, done_rx) = oneshot::channel::<io::Result<Vec<u8>>>();
+    tokio::spawn(async move {
+        let ch = rx.recv().await.unwrap();
+        let mut s = ch.stream;
+        let mut all = Vec::new();
+        let _ = done_tx.send(s.read_to_end(&mut all).await.map(|_| all));
+    });
+    let server_handle = handle.clone();
+    tokio::spawn(async move {
+        let _ = driver::serve_with_handle(server_io, server_cfg(), hooks(), tx, server_handle).await;
+    });
+
+    let mut c = Client::connect(client_io, "proxy", "proxy").await;
+    let id = c.open("h", 1).await;
+    c.conn.send_close(id).unwrap();
+    let mut done_rx = done_rx;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let got = loop {
+        c.pump_once().await;
+        while c.conn.pop_event().is_some() {}
+        match done_rx.try_recv() {
+            Ok(v) => break v,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline, "reader still pending after peer CLOSE");
+            }
+            Err(e) => panic!("reader task died: {e}"),
+        }
+    };
+    let body = got.expect("reader error after idle CLOSE");
+    assert!(body.is_empty(), "idle channel CLOSE must yield empty EOF, got {} bytes", body.len());
+    let t0 = Instant::now();
+    while handle.channel_count() > 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "driver still tracks {} closed channel(s)",
+            handle.channel_count()
+        );
+        c.pump_once().await;
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Open/CLOSE many channels on one long-lived session. Each one must leave
+/// the driver's map, otherwise a SOCKS-style embedder leaks per-channel
+/// buffers for the life of the SSH connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_channels_do_not_accumulate_in_driver() {
+    const N: usize = 64;
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (tx, mut rx) = mpsc::unbounded_channel::<IncomingChannel>();
+    let handle = SessionHandle::new();
+    tokio::spawn(async move {
+        while let Some(ch) = rx.recv().await {
+            drop(ch.stream);
+        }
+    });
+    let server_handle = handle.clone();
+    tokio::spawn(async move {
+        let _ = driver::serve_with_handle(server_io, server_cfg(), hooks(), tx, server_handle).await;
+    });
+
+    let mut c = Client::connect(client_io, "proxy", "proxy").await;
+    for i in 0..N {
+        let id = c.open("h", (i + 1) as u16).await;
+        c.conn.send_close(id).unwrap();
+        c.pump_until(|conn| !conn.channel_alive(id)).await;
+    }
+    let t0 = Instant::now();
+    while handle.channel_count() > 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "driver leaked {} channel(s) after {N} close cycles",
+            handle.channel_count()
+        );
+        c.pump_once().await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(c.conn.active_channels(), 0, "core table still holds closed channels");
 }
 
 /// Every way the driver can end — peer gone, future dropped — must wake a

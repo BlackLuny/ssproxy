@@ -230,6 +230,10 @@ impl Drop for ChannelStream {
     fn drop(&mut self) {
         let mut s = self.shared.lock();
         s.dropped = true;
+        // Nobody will read these; release them immediately rather than
+        // waiting for the driver (which may not visit us until the peer CLOSE).
+        s.to_app.clear();
+        s.to_app_bytes = 0;
         s.signal();
     }
 }

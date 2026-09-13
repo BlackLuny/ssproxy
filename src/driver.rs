@@ -3,7 +3,7 @@
 //! sans-IO; this is the only place `.await` happens.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +82,10 @@ pub struct IncomingChannel {
 pub struct SessionHandle {
     cancel: Arc<AtomicBool>,
     notify: Arc<Notify>,
+    /// Live `direct-tcpip` streams still tracked by the driver (including
+    /// ones whose core slot is already gone). Embedders can watch this to
+    /// detect a session-lifetime leak of closed channels.
+    live: Arc<AtomicUsize>,
 }
 
 impl SessionHandle {
@@ -90,12 +94,19 @@ impl SessionHandle {
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
+            live: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn shutdown(&self) {
         self.cancel.store(true, Ordering::SeqCst);
         self.notify.notify_one();
+    }
+
+    /// Number of channel streams the driver still holds. Drops to zero once
+    /// every `direct-tcpip` channel has been fully closed (or the session ends).
+    pub fn channel_count(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
     }
 }
 
@@ -128,7 +139,6 @@ const READ_CHUNK: usize = 32 * 1024;
 /// Dropping it — however the driver exits: clean close, error, timeout,
 /// cancellation, or the future being dropped mid-await — terminates every
 /// stream so no reader or writer is left pending forever.
-#[derive(Default)]
 struct Chans {
     map: HashMap<u32, Arc<Mutex<ChanShared>>>,
     clean: bool,
@@ -138,6 +148,30 @@ struct Chans {
     /// without this a channel parked by the backlog waits for an unrelated
     /// event (a WINDOW_ADJUST, more writes) to be looked at.
     out_blocked: Vec<u32>,
+    live: Arc<AtomicUsize>,
+}
+
+impl Chans {
+    fn new(live: Arc<AtomicUsize>) -> Self {
+        Self {
+            map: HashMap::new(),
+            clean: false,
+            out_blocked: Vec::new(),
+            live,
+        }
+    }
+
+    fn insert(&mut self, id: u32, shared: Arc<Mutex<ChanShared>>) {
+        if self.map.insert(id, shared).is_none() {
+            self.live.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn remove(&mut self, id: u32) {
+        if self.map.remove(&id).is_some() {
+            self.live.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for Chans {
@@ -145,6 +179,7 @@ impl Drop for Chans {
         for sh in self.map.values() {
             sh.lock().terminate(self.clean);
         }
+        self.live.store(0, Ordering::Relaxed);
     }
 }
 
@@ -177,7 +212,7 @@ where
     let base = cfg.base.clone();
     let mut conn = Connection::server(cfg);
     let ready = Arc::new(ReadyList::new(handle.notify.clone()));
-    let mut chans = Chans::default();
+    let mut chans = Chans::new(handle.live.clone());
     // Transport bytes land here directly; the core consumes whole frames from
     // the front. Grown lazily: an idle session holds no read buffer.
     let mut inbuf = BytesMut::new();
@@ -253,7 +288,7 @@ where
                                 base.channel_rx_cap,
                                 ready.clone(),
                             )));
-                            chans.map.insert(local_id, shared.clone());
+                            chans.insert(local_id, shared.clone());
                             conn.accept_channel(local_id)?;
                             idle_dl.disarm();
                             let _ = incoming.send(IncomingChannel {
@@ -276,17 +311,24 @@ where
                     // Surfaced by `pump_one`, which raises EOF only after the
                     // bytes received before it have been handed over.
                 }
-                Event::ChannelClose { local_id } => match chans.map.get(&local_id) {
-                    Some(sh) => {
-                        let mut s = sh.lock();
-                        s.closed = true; // peer accepts no more; reads still drain
-                        s.wake_writer();
+                Event::ChannelClose { local_id } => {
+                    if let Some(sh) = chans.map.get(&local_id).cloned() {
+                        {
+                            let mut s = sh.lock();
+                            s.closed = true; // peer accepts no more; reads still drain
+                            s.wake_writer();
+                        }
+                        // The core may already have freed the slot (both CLOSEs
+                        // done, queues empty). Pump anyway: that is what drops
+                        // the driver map entry and wakes a pending reader.
+                        pump_one(&mut conn, &mut chans, local_id);
+                    } else {
+                        // A `session` channel has no stream here (every request on it
+                        // is refused), so nothing will ever read what it buffered —
+                        // drop it now rather than hold the slot and its window.
+                        conn.discard_inbound(local_id);
                     }
-                    // A `session` channel has no stream here (every request on it
-                    // is refused), so nothing will ever read what it buffered —
-                    // drop it now rather than hold the slot and its window.
-                    None => conn.discard_inbound(local_id),
-                },
+                }
                 Event::Disconnect { .. } => {}
                 _ => {}
             }
@@ -532,7 +574,7 @@ fn pump_one(conn: &mut Connection, chans: &mut Chans, id: u32) {
     };
     if !conn.channel_alive(id) {
         shared.lock().terminate(true);
-        chans.map.remove(&id);
+        chans.remove(id);
         return;
     }
 
@@ -545,7 +587,11 @@ fn pump_one(conn: &mut Connection, chans: &mut Chans, id: u32) {
         // why not at consumption); what does not fit stays in the core,
         // un-credited, and the reader asks for a refill when it has room.
         let mut credited = 0usize;
-        if !s.dropped {
+        if s.dropped {
+            // The stream is gone: unread peer bytes will never be consumed.
+            s.to_app.clear();
+            s.to_app_bytes = 0;
+        } else {
             let mut moved = false;
             while s.to_app_bytes < s.rx_cap {
                 let Some(b) = conn.take_inbound(id) else { break };
@@ -626,8 +672,12 @@ fn pump_one(conn: &mut Connection, chans: &mut Chans, id: u32) {
     // refuses further data after `sent_close`).
     if dropped && from_app_empty {
         let _ = conn.send_close(id);
-        if !conn.channel_alive(id) {
-            chans.map.remove(&id);
-        }
+    }
+    // `consume_credit` / `send_close` may have just freed the core slot.
+    // Drop our map entry even if the stream handle is still draining `to_app`;
+    // the handle holds the remaining Arc.
+    if !conn.channel_alive(id) {
+        shared.lock().terminate(true);
+        chans.remove(id);
     }
 }
