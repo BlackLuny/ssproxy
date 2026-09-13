@@ -40,6 +40,7 @@ pub struct Session {
 impl Session {
     pub fn new(ssh: TcpStream, cfg: Arc<ServerConfig>) -> Self {
         let _ = ssh.set_nodelay(true);
+        tcp_quickack(&ssh);
         let conn = Connection::server(cfg.clone());
         let max_packet = cfg.max_packet as usize;
         Self {
@@ -135,6 +136,9 @@ impl Session {
                 .disconnect(SSH_DISCONNECT_BY_APPLICATION, "connection lost");
             return Poll::Ready(Ok(true));
         }
+        // OpenSSH leaves Nagle on until after auth. A read with no immediate
+        // reply (KEXINIT, NEWKEYS) otherwise waits for Linux delayed ACK (~40ms).
+        tcp_quickack(&self.ssh);
         self.conn
             .read_buf_mut()
             .extend_from_slice(&self.ssh_tmp[..n]);
@@ -300,6 +304,26 @@ impl Session {
             }
         }
         Ok(progress)
+    }
+}
+
+/// Linux `TCP_QUICKACK` is not sticky; re-arm after each read so the kernel
+/// ACKs immediately instead of waiting up to ~40ms to piggyback.
+fn tcp_quickack(_stream: &TcpStream) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = _stream.as_raw_fd();
+        let on: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&on) as libc::socklen_t,
+            );
+        }
     }
 }
 

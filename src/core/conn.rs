@@ -139,6 +139,9 @@ impl Connection {
         );
         c.server = Some(cfg);
         c.queue_ident();
+        // RFC 4253: KEXINIT may follow our ident immediately; waiting for the
+        // peer banner costs a round-trip and lets OpenSSH's Nagle stall.
+        let _ = c.start_kex();
         c
     }
 
@@ -157,6 +160,7 @@ impl Connection {
         );
         c.client = Some(cfg);
         c.queue_ident();
+        let _ = c.start_kex();
         c
     }
 
@@ -306,7 +310,7 @@ impl Connection {
     }
 
     fn maybe_start_kex(&mut self) {
-        if self.ident_out.is_none() && self.ident_in_done && !self.sent_kexinit {
+        if !self.sent_kexinit {
             let _ = self.start_kex();
         }
     }
@@ -1068,9 +1072,11 @@ impl Connection {
             self.send_seq = 0;
         }
         tracing::debug!(role = ?self.role, seq = self.send_seq, "sent NEWKEYS");
-        if self.peer_ext_info && !self.first_kex_done && self.role == Role::Server {
-            self.send_ext_info()?;
-        }
+        // Do not send EXT_INFO here. OpenSSH keeps Nagle on until auth; if our
+        // first encrypted packet goes out *before* the client's NEWKEYS, the
+        // client then sends NEWKEYS with nothing to piggyback an ACK on and
+        // waits ~40ms for delayed ACK before SERVICE_REQUEST. Send EXT_INFO
+        // after *both* NEWKEYS so it ACKs the client's packet.
         self.try_complete_kex()
     }
 
@@ -1102,6 +1108,9 @@ impl Connection {
         self.packets_io = 0;
         if !self.first_kex_done {
             self.first_kex_done = true;
+            if self.role == Role::Server && self.peer_ext_info {
+                self.send_ext_info()?;
+            }
             if self.role == Role::Client {
                 self.send_service_request()?;
             }
