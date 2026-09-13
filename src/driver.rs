@@ -76,9 +76,23 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// A fresh handle, to pass to [`serve_with_handle`] and cancel externally.
+    pub fn new() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
     pub fn shutdown(&self) {
         self.cancel.store(true, Ordering::SeqCst);
         self.notify.notify_one();
+    }
+}
+
+impl Default for SessionHandle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -109,11 +123,7 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let handle = SessionHandle {
-        cancel: Arc::new(AtomicBool::new(false)),
-        notify: Arc::new(Notify::new()),
-    };
-    serve_with_handle(io, cfg, hooks, incoming, handle).await
+    serve_with_handle(io, cfg, hooks, incoming, SessionHandle::new()).await
 }
 
 /// Like [`serve`] but with a caller-provided [`SessionHandle`] for cancellation.
