@@ -414,20 +414,40 @@ impl Connection {
             return Ok(false);
         }
         self.partial = None;
-        let mut pkt = self.read_buf.split_to(total);
+        // Decrypt the frame in place, inside the receive buffer, and hand the
+        // application an exact-size copy of the payload.
+        //
+        // The tempting alternative — `split_to(total)` then `freeze()` the view
+        // — is far more expensive than it looks: a `BytesMut` split off a vector
+        // is a *view* of the same allocation, and `freeze()` has to promote it to
+        // the shared representation by reallocating and copying the whole
+        // underlying buffer. Worse, the remaining buffer is then shared, so the
+        // next `extend_from_slice` must allocate again. Measured on a real
+        // single-stream session: ~6200 `mmap`/`munmap` *pairs per second* with
+        // 48–128 KiB mappings, i.e. per packet one large allocation, one large
+        // copy, and the kernel zeroing pages + shooting down TLB entries for it.
+        // Keeping the payload an owned copy instead leaves `read_buf` unique, so
+        // it is reused in place and nothing else in the hot path allocates.
+        let seq = self.recv_seq;
+        let buf = &mut self.read_buf;
         // Restore decrypted head bytes (CTR non-ETM decrypted them above).
-        pkt[..head_len].copy_from_slice(&head[..head_len]);
-        let (body, tagb) = pkt.split_at_mut(4 + length);
-        self.recv_cipher.open(self.recv_seq, body, tagb)?;
-        let pad = pkt[4] as usize;
-        if pad < 4 || 1 + pad > length {
-            return Err(Error::protocol("bad padding"));
-        }
-        let pkt = pkt.freeze();
-        let payload = pkt.slice(5..4 + length - pad);
+        buf[..head_len].copy_from_slice(&head[..head_len]);
+        let payload = {
+            let (pkt, _rest) = buf.split_at_mut(total);
+            let (body, tagb) = pkt.split_at_mut(4 + length);
+            self.recv_cipher.open(seq, body, tagb)?;
+            let pad = pkt[4] as usize;
+            if pad < 4 || 1 + pad > length {
+                return Err(Error::protocol("bad padding"));
+            }
+            Bytes::copy_from_slice(&pkt[5..4 + length - pad])
+        };
         if payload.is_empty() {
             return Err(Error::protocol("empty payload"));
         }
+        // Consume the frame: the buffer keeps its allocation and `reserve`
+        // moves the leftovers back to the front when the next read arrives.
+        bytes::Buf::advance(buf, total);
         self.recv_seq = self.recv_seq.wrapping_add(1);
         self.bytes_since_kex += total as u64;
         let msg = payload[0];
