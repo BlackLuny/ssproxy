@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::{OsRng, StdRng};
+use rand::{RngCore, SeedableRng};
 
 use crate::config::{ClientConfig, Config, ServerConfig};
 use crate::core::channel::{Channel, ChannelKind, ChannelTable};
@@ -104,6 +104,12 @@ pub struct Connection {
     ident_out: Option<Bytes>,
 
     // Framing / transport.
+    /// 每连接的用户态 CSPRNG，**只**用来填 SSH 包 padding。
+    /// 原先每封包一次 `OsRng.fill_bytes` = 每包一次 getrandom 系统调用
+    /// （真机 strace：8s 内 115602 次，约每 2.3 次 sendto 一次）。padding 只为掩盖
+    /// 长度，用系统熵播种的 CSPRNG 完全合规（russh 的 safe_rng 同样做法）。
+    /// KEX 密钥与 KEXINIT cookie 仍走 OsRng，不受影响。
+    pad_rng: StdRng,
     read_buf: BytesMut,
     partial: Option<PartialFrame>,
     send_seq: u32,
@@ -186,6 +192,7 @@ impl Connection {
             ident_acc: Vec::new(),
             ident_done: false,
             ident_out: None,
+            pad_rng: StdRng::from_entropy(),
             read_buf: BytesMut::with_capacity(16 * 1024),
             partial: None,
             send_seq: 0,
@@ -733,6 +740,11 @@ impl Connection {
             let _ = self.emit_eof(id);
             let _ = self.emit_close(id);
             self.channels.mark(id);
+            // Credits withheld while the key exchange was running have to be
+            // re-offered here: the application already drained those bytes, so
+            // nothing else will ever call `maybe_adjust_window` again and the
+            // peer would sit at a zero window forever.
+            self.maybe_adjust_window(id);
         }
         Ok(())
     }
@@ -1032,7 +1044,8 @@ impl Connection {
 
     fn next_window(&self) -> u32 {
         let room = self.cfg.window_budget.saturating_sub(self.window_used);
-        (self.cfg.window_initial as u64).min(room) as u32
+        let per_channel = self.cfg.window_initial.min(self.cfg.window_max);
+        (per_channel as u64).min(room) as u32
     }
 
     /// Confirm a channel the driver accepted.
@@ -1209,7 +1222,7 @@ impl Connection {
     }
 
     pub fn consume_inbound(&mut self, id: u32, n: usize) {
-        let budget_room = {
+        {
             let Some(ch) = self.channels.get_mut(id) else {
                 return;
             };
@@ -1224,12 +1237,22 @@ impl Connection {
                 let _ = front.split_to(take);
                 ch.in_q_bytes -= take;
             }
-            self.cfg.window_max.saturating_sub(ch.recv_max)
-        };
-        self.maybe_adjust_window(id, budget_room);
+        }
+        self.maybe_adjust_window(id);
+        // Draining the last bytes of an already-closed channel releases it.
+        self.finalize_channel(id);
     }
 
-    fn maybe_adjust_window(&mut self, id: u32, budget_room: u32) {
+    /// Discard peer bytes the application will never read (its stream is gone).
+    pub fn discard_inbound(&mut self, id: u32) {
+        if let Some(ch) = self.channels.get_mut(id) {
+            ch.in_q.clear();
+            ch.in_q_bytes = 0;
+        }
+        self.finalize_channel(id);
+    }
+
+    fn maybe_adjust_window(&mut self, id: u32) {
         if self.kex_blocks_app {
             return;
         }
@@ -1237,7 +1260,7 @@ impl Connection {
             let Some(ch) = self.channels.get(id) else {
                 return;
             };
-            (ch.remote_id, ch.window_adjust(budget_room))
+            (ch.remote_id, ch.window_adjust())
         };
         if add == 0 {
             return;
@@ -1282,14 +1305,16 @@ impl Connection {
                 break;
             }
             let n = cap.min(data.len() - sent);
-            let chunk = Bytes::copy_from_slice(&data[sent..sent + n]);
-            self.enqueue_out(id, chunk)?;
+            self.enqueue_out(id, &data[sent..sent + n])?;
             sent += n;
         }
         Ok(sent)
     }
 
-    fn enqueue_out(&mut self, id: u32, chunk: Bytes) -> Result<()> {
+    /// Hand `data` to the channel. Copies only when it has to be parked
+    /// (window exhausted, or a key exchange is running); the straight-to-wire
+    /// path seals the caller's bytes directly.
+    fn enqueue_out(&mut self, id: u32, data: &[u8]) -> Result<()> {
         let (remote, wire_now, max_pkt, window) = {
             let Some(ch) = self.channels.get(id) else {
                 return Ok(());
@@ -1303,30 +1328,31 @@ impl Connection {
         };
         if !wire_now || remote.is_none() || window == 0 {
             if let Some(ch) = self.channels.get_mut(id) {
-                ch.pending_out_bytes += chunk.len();
-                ch.pending_out.push_back(chunk);
+                ch.pending_out_bytes += data.len();
+                ch.pending_out.push_back(Bytes::copy_from_slice(data));
             }
             return Ok(());
         }
-        let n = chunk.len().min(max_pkt as usize).min(window as usize);
-        if n < chunk.len() {
+        let n = data.len().min(max_pkt as usize).min(window as usize);
+        if n < data.len() {
             if let Some(ch) = self.channels.get_mut(id) {
-                ch.pending_out.push_front(chunk.slice(n..));
-                ch.pending_out_bytes += chunk.len() - n;
+                ch.pending_out.push_front(Bytes::copy_from_slice(&data[n..]));
+                ch.pending_out_bytes += data.len() - n;
             }
         }
         if let Some(ch) = self.channels.get_mut(id) {
             ch.send_window -= n as u32;
         }
-        self.send_channel_data(remote.unwrap(), &chunk[..n])
+        self.send_channel_data(remote.unwrap(), &data[..n])
     }
 
     fn send_channel_data(&mut self, remote: u32, data: &[u8]) -> Result<()> {
-        let mut p = Vec::with_capacity(9 + data.len());
-        p.push(SSH_MSG_CHANNEL_DATA);
-        wire::put_u32(&mut p, remote);
-        wire::put_bytes(&mut p, data);
-        self.queue(&p)
+        let len = data.len() as u32;
+        let mut hdr = [0u8; 9];
+        hdr[0] = SSH_MSG_CHANNEL_DATA;
+        hdr[1..5].copy_from_slice(&remote.to_be_bytes());
+        hdr[5..9].copy_from_slice(&len.to_be_bytes());
+        self.queue_parts(&[&hdr, data])
     }
 
     fn flush_channel(&mut self, id: u32) {
@@ -1343,10 +1369,11 @@ impl Connection {
                     ch.pending_out.front().map(|b| b.len()).unwrap_or(0),
                     ch.peer_max_packet,
                     ch.send_window,
-                    ch.can_send(),
+                    ch.can_write(),
                 )
             };
-            if !can || remote.is_none() || window == 0 || len == 0 || self.write_bytes >= self.cfg.out_soft {
+            if !can || remote.is_none() || window == 0 || len == 0 || self.write_bytes >= self.cfg.out_soft
+            {
                 return;
             }
             let take = len.min(max_pkt as usize).min(window as usize);
@@ -1396,11 +1423,13 @@ impl Connection {
             let Some(ch) = self.channels.get_mut(id) else {
                 return Ok(());
             };
-            if ch.sent_eof || ch.sent_close {
+            if ch.sent_close {
                 return Ok(());
             }
             ch.sent_eof = true;
         }
+        // Not short-circuited on an already-set flag: `emit_eof` defers while
+        // `pending_out` is non-empty, and this call is the retry.
         self.emit_eof(id)
     }
 
@@ -1409,13 +1438,20 @@ impl Connection {
             let Some(ch) = self.channels.get_mut(id) else {
                 return Ok(());
             };
-            if ch.sent_close {
-                return Ok(());
-            }
             ch.sent_close = true;
             ch.sent_eof = true;
         }
+        // Retried on every call: a first attempt made while `pending_out` still
+        // held bytes would otherwise never be repeated, leaving the channel open
+        // with a tail the peer never receives.
         self.emit_close(id)
+    }
+
+    /// Push the connection's own queued channel data out while peer credit
+    /// allows. `pending_out` fills up only while a key exchange blocks
+    /// application data, and nothing else re-drives it afterwards.
+    pub fn flush_pending(&mut self, id: u32) {
+        self.flush_channel(id);
     }
 
     fn emit_eof(&mut self, id: u32) -> Result<()> {
@@ -1464,11 +1500,14 @@ impl Connection {
         Ok(())
     }
 
+    /// Release a fully closed channel. A CHANNEL_CLOSE says the peer will send
+    /// no more data — it does not cancel bytes that already arrived, so the slot
+    /// (and its `in_q`) is kept until the application has drained them.
     fn finalize_channel(&mut self, id: u32) {
         let done = self
             .channels
             .get(id)
-            .map(|c| c.got_close && c.wire_close)
+            .map(|c| c.got_close && c.wire_close && c.in_q.is_empty())
             .unwrap_or(false);
         if done {
             let window = self.channels.get(id).map(|c| c.recv_max as u64).unwrap_or(0);
@@ -1546,20 +1585,41 @@ impl Connection {
     // ── low-level packet sealing ─────────────────────────────────────────────
 
     fn queue(&mut self, payload: &[u8]) -> Result<()> {
-        if payload.is_empty() {
+        self.queue_parts(&[payload])
+    }
+
+    /// Seal `parts` as one packet's payload. Callers that assemble a payload
+    /// from a header plus a body pass both slices and skip the intermediate
+    /// buffer — the sealed frame is the only allocation on the wire path.
+    fn queue_parts(&mut self, parts: &[&[u8]]) -> Result<()> {
+        let payload_len: usize = parts.iter().map(|p| p.len()).sum();
+        if payload_len == 0 {
             return Err(Error::protocol("empty payload"));
         }
         let block = self.send_cipher.block_size();
         let tag = self.send_cipher.tag_len();
         let aad = self.send_cipher.length_is_aad();
-        let pad = padding_len(payload.len(), block, aad);
-        let plen = 1 + payload.len() + pad;
+        let pad = padding_len(payload_len, block, aad);
+        let plen = 1 + payload_len + pad;
         let total = 4 + plen + tag;
-        let mut buf = BytesMut::zeroed(total);
+        // Every byte of the frame is written below — length, pad byte, payload,
+        // random padding, and then `seal` fills the tag and encrypts in place —
+        // so there is nothing to pre-zero. `BytesMut::zeroed` would memset a
+        // 32 KiB buffer per packet on a path measured at ~4.6 ns/byte.
+        let mut buf = BytesMut::with_capacity(total);
+        // SAFETY: capacity for exactly `total` was just reserved; the bytes are
+        // uninitialised and every one of them is overwritten before any read of
+        // the buffer (the writes below, then `seal`, which reads only what was
+        // written and overwrites the packet in place).
+        unsafe { buf.set_len(total) };
         buf[..4].copy_from_slice(&(plen as u32).to_be_bytes());
         buf[4] = pad as u8;
-        buf[5..5 + payload.len()].copy_from_slice(payload);
-        OsRng.fill_bytes(&mut buf[5 + payload.len()..5 + payload.len() + pad]);
+        let mut off = 5;
+        for part in parts {
+            buf[off..off + part.len()].copy_from_slice(part);
+            off += part.len();
+        }
+        self.pad_rng.fill_bytes(&mut buf[off..off + pad]);
         let (pkt, tag_out) = buf.split_at_mut(4 + plen);
         self.send_cipher.seal(self.send_seq, pkt, tag_out)?;
         self.send_seq = self.send_seq.wrapping_add(1);

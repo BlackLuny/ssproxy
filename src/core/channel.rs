@@ -71,24 +71,46 @@ impl Channel {
     }
 
     /// Window-adjust increment to advertise, or 0 if not worth it yet.
-    /// `budget_room` caps how much the window may grow this session-wide.
-    pub fn window_adjust(&self, budget_room: u32) -> u32 {
+    ///
+    /// Credit is restored to `recv_max - in_q_bytes`: everything the peer sent
+    /// that we have already handed to the application. That is replenishment,
+    /// not growth — `recv_max` is fixed when the channel opens — so it must not
+    /// be gated on any session-level allowance. Throttling it here (an earlier
+    /// `min(recv_window + budget_room)` did exactly that) wedges the channel:
+    /// once the window hits zero with an exhausted allowance, no adjust is ever
+    /// produced again and the peer waits forever.
+    pub fn window_adjust(&self) -> u32 {
         let used = self.in_q_bytes as u32;
-        let target = self.recv_max.saturating_sub(used).min(self.recv_window + budget_room);
+        let target = self.recv_max.saturating_sub(used);
         if target <= self.recv_window {
             return 0;
         }
         let add = target - self.recv_window;
-        // Only bother once we've drained a quarter (avoid a WINDOW_ADJUST storm).
-        if add >= self.recv_max / 4 || self.recv_window < self.recv_max / 4 {
+        // Advertise in small steps. This is not about bandwidth (an adjust is
+        // ~30 bytes) but about *when* the peer may send again: a peer that
+        // parks on a read once its own buffer fills wakes on the first adjust,
+        // so a coarse step leaves it idle while we drain a whole quarter
+        // window. Measured with such a peer, 64 KiB steps (1/16 of the default
+        // 1 MiB window) nearly double single-stream throughput versus 256 KiB
+        // steps; going finer than 1/16 buys nothing further.
+        if add >= self.recv_max / 16 || self.recv_window < self.recv_max / 16 {
             add
         } else {
             0
         }
     }
 
+    /// May the application still hand us new data for this channel?
     pub fn can_send(&self) -> bool {
-        self.open_confirmed && !self.sent_eof && !self.sent_close && self.remote_id.is_some()
+        self.can_write() && !self.sent_eof && !self.sent_close
+    }
+
+    /// May bytes still go on the wire? True even after EOF/CLOSE were *marked*:
+    /// those only stop new application data, and the peer has not seen the
+    /// marker yet, so anything already buffered must still be flushed ahead of
+    /// it (RFC 4254 §5.3 — data precedes the close).
+    pub fn can_write(&self) -> bool {
+        self.open_confirmed && self.remote_id.is_some()
     }
 }
 

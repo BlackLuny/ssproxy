@@ -76,7 +76,10 @@ pub struct Config {
     pub max_packet: u32,
     /// Initial per-channel receive window.
     pub window_initial: u32,
-    /// Upper bound for the auto-tuned receive window.
+    /// Ceiling on a channel's receive window: the advertised window is
+    /// `min(window_initial, window_max)`. It is fixed for the channel's life —
+    /// window credit is replenished, never grown, so this is a hard cap on the
+    /// bytes one channel may keep in flight.
     pub window_max: u32,
     /// Sum of all channel windows in one session may not exceed this.
     pub window_budget: u64,
