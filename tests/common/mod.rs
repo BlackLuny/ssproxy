@@ -71,6 +71,47 @@ pub async fn spawn_http(body: &'static [u8]) -> std::net::SocketAddr {
     addr
 }
 
+/// Flood *downstream* forever and never read. This is the russh RC2 dest:
+/// the server can still produce CHANNEL_DATA, but inbound (client→dest)
+/// fills the TCP window and then the SSH recv window.
+pub async fn spawn_flood_write_only() -> std::net::SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                break;
+            };
+            let _ = s.set_nodelay(true);
+            tokio::spawn(async move {
+                let buf = vec![0xABu8; 8 * 1024];
+                loop {
+                    if s.write_all(&buf).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Accept and hold sockets without reading or writing (pure inbound freeze).
+pub async fn spawn_freeze() -> std::net::SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((s, _)) = l.accept().await else {
+                break;
+            };
+            held.push(s);
+        }
+    });
+    addr
+}
+
 /// Slow reader: accepts and reads 1 byte every `delay`.
 pub async fn spawn_trickle(delay: std::time::Duration) -> std::net::SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -122,7 +163,7 @@ impl ClientPump {
         }
     }
 
-    fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
+    pub fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
         let mut progress = false;
         let mut pending = false;
         #[allow(clippy::while_let_loop)]
