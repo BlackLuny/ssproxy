@@ -222,9 +222,17 @@ async fn closed_channels_do_not_accumulate_in_driver() {
 
     let mut c = Client::connect(client_io, "proxy", "proxy").await;
     for i in 0..N {
-        let id = c.open("h", (i + 1) as u16).await;
-        c.conn.send_close(id).unwrap();
-        c.pump_until(|conn| !conn.channel_alive(id)).await;
+        let id = c.conn.open_direct_tcpip("h", (i + 1) as u16).unwrap();
+        // Server drops the stream at once, so CONFIRMATION and CLOSE can land
+        // together; the channel may already be gone by the time we look.
+        c.pump_until(|conn| {
+            conn.send_capacity(id) > 0 || conn.channel_got_eof(id) || !conn.channel_alive(id)
+        })
+        .await;
+        if c.conn.channel_alive(id) {
+            c.conn.send_close(id).unwrap();
+            c.pump_until(|conn| !conn.channel_alive(id)).await;
+        }
     }
     let t0 = Instant::now();
     while handle.channel_count() > 0 {
