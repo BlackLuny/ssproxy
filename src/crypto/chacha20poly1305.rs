@@ -1,78 +1,64 @@
-use chacha20::cipher::{KeyIvInit, StreamCipher};
-use chacha20::ChaCha20;
-use poly1305::universal_hash::KeyInit;
-use poly1305::Poly1305;
-use subtle::ConstantTimeEq;
+use aws_lc_rs::aead::chacha20_poly1305_openssh::{OpeningKey, SealingKey, TAG_LEN};
 
 use crate::error::{Error, Result};
 
-const TAG: usize = 16;
-
-/// OpenSSH `chacha20-poly1305@openssh.com`. 64-byte key = K_2 (payload) || K_1
-/// (length). For sequence numbers below 2^32 the IETF ChaCha20 state with a
-/// 12-byte nonce `[0u8;8] || seq_be` coincides with OpenSSH's original-ChaCha
-/// counter/nonce layout, so this interoperates with OpenSSH.
+/// OpenSSH `chacha20-poly1305@openssh.com`, backed by aws-lc-rs's purpose-built
+/// implementation of that exact construction (assembly-optimised; the same
+/// backend russh uses, and already present in the zfc dependency tree).
+///
+/// The 64-byte key is handed over verbatim: aws-lc splits it as
+/// `K_2 (payload) || K_1 (length)` — the same convention `kdf::derive` produces
+/// and the same one the previous hand-rolled implementation used, so this is a
+/// drop-in with no re-keying.
+///
+/// Both a sealing and an opening key are built from the same material because
+/// `DirectionKeys` does not know which direction it serves; each is just a key
+/// schedule, so the cost is negligible.
 pub struct ChaCha20Poly1305Ssh {
-    payload_key: [u8; 32],
-    length_key: [u8; 32],
+    sealing: SealingKey,
+    opening: OpeningKey,
 }
 
 impl ChaCha20Poly1305Ssh {
     pub fn new(key: &[u8; 64]) -> Self {
-        let mut payload_key = [0u8; 32];
-        let mut length_key = [0u8; 32];
-        payload_key.copy_from_slice(&key[..32]);
-        length_key.copy_from_slice(&key[32..]);
         Self {
-            payload_key,
-            length_key,
+            sealing: SealingKey::new(key),
+            opening: OpeningKey::new(key),
         }
     }
 
-    fn nonce(seq: u32) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[8..].copy_from_slice(&seq.to_be_bytes());
-        n
-    }
-
-    pub fn decrypt_length(&self, seq: u32, mut enc: [u8; 4]) -> [u8; 4] {
-        let mut c = ChaCha20::new((&self.length_key).into(), (&Self::nonce(seq)).into());
-        c.apply_keystream(&mut enc);
-        enc
-    }
-
-    fn poly_key(&self, seq: u32) -> [u8; 32] {
-        let mut c = ChaCha20::new((&self.payload_key).into(), (&Self::nonce(seq)).into());
-        let mut block0 = [0u8; 32];
-        c.apply_keystream(&mut block0);
-        block0
-    }
-
-    fn apply_payload(&self, seq: u32, data: &mut [u8]) {
-        let mut c = ChaCha20::new((&self.payload_key).into(), (&Self::nonce(seq)).into());
-        // Consume counter block 0 (the Poly1305 key) so payload uses block 1.
-        let mut skip = [0u8; 64];
-        c.apply_keystream(&mut skip);
-        c.apply_keystream(data);
+    pub fn decrypt_length(&self, seq: u32, enc: [u8; 4]) -> [u8; 4] {
+        self.opening.decrypt_packet_length(seq, enc)
     }
 
     pub fn seal(&self, seq: u32, pkt: &mut [u8], tag_out: &mut [u8]) -> Result<()> {
-        let mut lc = ChaCha20::new((&self.length_key).into(), (&Self::nonce(seq)).into());
-        lc.apply_keystream(&mut pkt[..4]);
-        self.apply_payload(seq, &mut pkt[4..]);
-        let tag = Poly1305::new((&self.poly_key(seq)).into()).compute_unpadded(pkt);
-        tag_out[..TAG].copy_from_slice(tag.as_slice());
+        let out = tag_out
+            .get_mut(..TAG_LEN)
+            .ok_or(Error::Crypto("chacha tag buffer"))?;
+        let mut tag = [0u8; TAG_LEN];
+        self.sealing.seal_in_place(seq, pkt, &mut tag);
+        out.copy_from_slice(&tag);
         Ok(())
     }
 
     pub fn open(&self, seq: u32, pkt: &mut [u8], tag: &[u8]) -> Result<()> {
-        let expected = Poly1305::new((&self.poly_key(seq)).into()).compute_unpadded(pkt);
-        if expected.as_slice().ct_eq(tag).unwrap_u8() == 0 {
-            return Err(Error::Crypto("poly1305 tag"));
-        }
-        self.apply_payload(seq, &mut pkt[4..]);
-        let plain = self.decrypt_length(seq, pkt[..4].try_into().unwrap());
-        pkt[..4].copy_from_slice(&plain);
+        let tag: &[u8; TAG_LEN] = tag
+            .try_into()
+            .map_err(|_| Error::Crypto("chacha tag len"))?;
+        // aws-lc authenticates over `encrypted_length || ciphertext` and decrypts
+        // only the payload, deliberately leaving the length field encrypted. Our
+        // contract (see `DirectionKeys::open`) is that the length is plaintext on
+        // return, so recover it here. Must be read before `open_in_place` borrows
+        // the buffer; the value itself is independent of the payload decryption.
+        let enc_len: [u8; 4] = pkt
+            .get(..4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(Error::Crypto("chacha short packet"))?;
+        let plain_len = self.opening.decrypt_packet_length(seq, enc_len);
+        self.opening
+            .open_in_place(seq, pkt, tag)
+            .map_err(|_| Error::Crypto("poly1305 tag"))?;
+        pkt[..4].copy_from_slice(&plain_len);
         Ok(())
     }
 }
