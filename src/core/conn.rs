@@ -2,21 +2,17 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use rand::rngs::OsRng;
 use rand::RngCore;
-use sha2::{Digest, Sha256};
-use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use crate::config::{ClientConfig, ServerConfig};
-use crate::crypto::{derive_block, padding_len, CipherKind, DirectionKeys, MAX_PACKET};
+use crate::config::{ClientConfig, Config, ServerConfig};
+use crate::core::channel::{Channel, ChannelKind, ChannelTable};
+use crate::crypto::{padding_len, CipherKind, DirectionKeys, HashAlg, MacKind, MAX_PACKET};
 use crate::error::{Error, Result};
-use crate::proto::msg::{
-    list_has, negotiate, KexInit, CLIENT_KEX, SERVER_CIPHERS, SERVER_COMP, SERVER_HOST_KEY,
-    SERVER_KEX, SERVER_MACS,
-};
+use crate::kex::{self, ClientKex, KexAlgo};
+use crate::proto::msg::{self, KexInit};
 use crate::proto::*;
 use crate::wire::{self, Parser};
-
-use super::channel::{Channel, ChannelKind, ChannelTable};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -24,40 +20,56 @@ pub enum Role {
     Client,
 }
 
+/// Events surfaced to the driver. Owned data keeps the borrow simple; all of
+/// these except channel data are low-frequency.
 #[derive(Debug)]
 pub enum Event {
-    HandshakeComplete {
-        user: String,
-    },
-    OpenDirectTcpIp {
-        local_id: u32,
-        host: String,
-        port: u32,
-    },
-    OpenSession {
-        local_id: u32,
-    },
-    ChannelOpenConfirmation {
-        local_id: u32,
-    },
-    ChannelOpenFailure {
-        local_id: u32,
-        reason: u32,
-        message: String,
-    },
-    ChannelData {
-        local_id: u32,
-    },
-    ChannelEof {
-        local_id: u32,
-    },
-    ChannelClose {
-        local_id: u32,
-    },
-    Disconnect {
-        reason: u32,
-        message: String,
-    },
+    /// First key exchange finished; transport is encrypted.
+    KexDone,
+    /// Password attempt awaiting `resolve_auth`.
+    AuthPassword { user: String, password: String },
+    /// Public-key probe (no signature) awaiting `resolve_auth`.
+    AuthPublicKeyProbe { user: String, algo: String, key_blob: Vec<u8> },
+    /// Public key with a valid signature, awaiting authorization via `resolve_auth`.
+    AuthPublicKey { user: String, algo: String, key_blob: Vec<u8> },
+    Authenticated { user: String },
+    OpenDirectTcpIp { local_id: u32, host: String, port: u16 },
+    OpenSession { local_id: u32 },
+    OpenConfirmed { local_id: u32 },
+    OpenFailed { local_id: u32, reason: u32, message: String },
+    ChannelData { local_id: u32 },
+    ChannelWindow { local_id: u32 },
+    ChannelEof { local_id: u32 },
+    ChannelClose { local_id: u32 },
+    Disconnect { reason: u32, message: String },
+}
+
+enum AuthKind {
+    Password,
+    PubkeyProbe,
+    Pubkey,
+}
+
+/// Context for the auth attempt awaiting the driver's verdict.
+struct AuthCtx {
+    kind: AuthKind,
+    user: String,
+    /// For a probe: the algorithm + key blob to echo back in PK_OK.
+    probe: Option<(String, Vec<u8>)>,
+}
+
+struct KexRun {
+    ours: Vec<u8>,
+    algo: KexAlgo,
+    cipher_c2s: CipherKind,
+    cipher_s2c: CipherKind,
+    mac_c2s: Option<MacKind>,
+    mac_s2c: Option<MacKind>,
+    hash: HashAlg,
+    theirs: Vec<u8>,
+    client: Option<ClientKex>,
+    /// Client role: our Q_C, needed for the exchange hash.
+    q_c: Vec<u8>,
 }
 
 struct PendingKeys {
@@ -65,626 +77,263 @@ struct PendingKeys {
     recv: DirectionKeys,
 }
 
-struct KexState {
-    ours: KexInit,
-    theirs: Option<KexInit>,
-    secret: Option<EphemeralSecret>,
-    local_pub: Option<[u8; 32]>,
-    cipher_c2s: Option<CipherKind>,
-    cipher_s2c: Option<CipherKind>,
+/// A frame whose length is known but whose body has not fully arrived. Kept so
+/// CTR-without-ETM head decryption (which mutates keystream) happens once.
+struct PartialFrame {
+    length: u32,
+    head: [u8; 16],
+    head_len: usize,
 }
 
 pub struct Connection {
     role: Role,
+    cfg: Arc<Config>,
     server: Option<Arc<ServerConfig>>,
     client: Option<Arc<ClientConfig>>,
+
+    // Our offered algorithm name-lists (owned; drive client-side negotiation).
+    our_kex: String,
+    our_ciphers: String,
+    our_macs: String,
+
+    // Identification strings.
     ident_local: String,
     ident_peer: Option<String>,
     ident_acc: Vec<u8>,
-    ident_in_done: bool,
+    ident_done: bool,
     ident_out: Option<Bytes>,
+
+    // Framing / transport.
     read_buf: BytesMut,
+    partial: Option<PartialFrame>,
     send_seq: u32,
     recv_seq: u32,
     send_cipher: DirectionKeys,
     recv_cipher: DirectionKeys,
-    bytes_io: u64,
-    packets_io: u32,
+    write_q: VecDeque<Bytes>,
+    current: Option<(Bytes, bool)>, // (bytes, is_ident)
+    write_bytes: usize,
+
+    // Rekey accounting.
+    bytes_since_kex: u64,
+
+    // Key exchange.
     strict_kex: bool,
     peer_ext_info: bool,
     session_id: Option<Vec<u8>>,
-    last_h: Option<Vec<u8>>,
-    peer_ks: Option<Vec<u8>>,
-    kex: Option<KexState>,
+    peer_hostkey: Option<Vec<u8>>,
+    kex: Option<KexRun>,
     pending_keys: Option<PendingKeys>,
     sent_kexinit: bool,
     sent_newkeys: bool,
     recv_newkeys: bool,
-    /// Single FIFO of already-sealed packets. A priority/data split would
-    /// let WINDOW_ADJUST or KEXINIT overtake CHANNEL_DATA and desync seq/MAC.
-    write_q: VecDeque<Bytes>,
-    current_out: Option<Bytes>,
-    current_is_ident: bool,
-    write_bytes: usize,
-    write_soft: usize,
-    write_hard: usize,
-    rekey_after_bytes: u64,
-    rekey_after_packets: u32,
-    channels: ChannelTable,
-    window: u32,
-    max_packet: u32,
-    events: VecDeque<Event>,
-    auth_fails: u32,
-    user: Option<String>,
-    authed: bool,
-    closed: bool,
-    kex_blocks_app: bool,
     first_kex_done: bool,
-    rr: u32,
+    kex_blocks_app: bool,
+
+    // Auth.
+    authed: bool,
+    user: Option<String>,
+    auth_fails: u32,
+    auth_ctx: Option<AuthCtx>,
+
+    // Connection layer.
+    channels: ChannelTable,
+    window_used: u64,
+    events: VecDeque<Event>,
+    closed: bool,
+    keepalive_outstanding: u32,
 }
 
 impl Connection {
     pub fn server(cfg: Arc<ServerConfig>) -> Self {
-        let ident = cfg.ident.clone();
-        let mut c = Self::new(
-            Role::Server,
-            ident,
-            cfg.write_buf_soft,
-            cfg.write_buf_hard,
-            cfg.rekey_after_bytes,
-            cfg.rekey_after_packets,
-            cfg.max_channels,
-            cfg.window,
-            cfg.max_packet,
-        );
+        let base = Arc::new(cfg.base.clone());
+        let mut c = Self::new(Role::Server, base);
         c.server = Some(cfg);
-        c.queue_ident();
-        // RFC 4253: KEXINIT may follow our ident immediately; waiting for the
-        // peer banner costs a round-trip and lets OpenSSH's Nagle stall.
-        let _ = c.start_kex();
+        c.start();
         c
     }
 
     pub fn client(cfg: Arc<ClientConfig>) -> Self {
-        let ident = cfg.ident.clone();
-        let mut c = Self::new(
-            Role::Client,
-            ident,
-            cfg.write_buf_soft,
-            cfg.write_buf_hard,
-            cfg.rekey_after_bytes,
-            cfg.rekey_after_packets,
-            256,
-            cfg.window,
-            cfg.max_packet,
-        );
+        let base = Arc::new(cfg.base.clone());
+        let mut c = Self::new(Role::Client, base);
         c.client = Some(cfg);
-        c.queue_ident();
-        let _ = c.start_kex();
+        c.start();
         c
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        role: Role,
-        ident: String,
-        write_soft: usize,
-        write_hard: usize,
-        rekey_after_bytes: u64,
-        rekey_after_packets: u32,
-        max_channels: u32,
-        window: u32,
-        max_packet: u32,
-    ) -> Self {
+    fn new(role: Role, cfg: Arc<Config>) -> Self {
+        let a = &cfg.algorithms;
+        let (kex_ext, strict) = match role {
+            Role::Server => (EXT_INFO_S, KEX_STRICT_S),
+            Role::Client => (EXT_INFO_C, KEX_STRICT_C),
+        };
+        let mut our_kex: String =
+            a.kex.iter().map(|k| k.name()).collect::<Vec<_>>().join(",");
+        our_kex.push(',');
+        our_kex.push_str(kex_ext);
+        our_kex.push(',');
+        our_kex.push_str(strict);
+        let our_ciphers = a.ciphers.iter().map(|c| c.name()).collect::<Vec<_>>().join(",");
+        let our_macs = a.macs.iter().map(|m| m.name()).collect::<Vec<_>>().join(",");
         Self {
             role,
-            server: None,
-            client: None,
-            ident_local: ident,
+            our_kex,
+            our_ciphers,
+            our_macs,
+            ident_local: cfg.ident.clone(),
+            channels: ChannelTable::new(cfg.max_channels),
             ident_peer: None,
             ident_acc: Vec::new(),
-            ident_in_done: false,
+            ident_done: false,
             ident_out: None,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            read_buf: BytesMut::with_capacity(16 * 1024),
+            partial: None,
             send_seq: 0,
             recv_seq: 0,
             send_cipher: DirectionKeys::Clear,
             recv_cipher: DirectionKeys::Clear,
-            bytes_io: 0,
-            packets_io: 0,
+            write_q: VecDeque::new(),
+            current: None,
+            write_bytes: 0,
+            bytes_since_kex: 0,
             strict_kex: false,
             peer_ext_info: false,
             session_id: None,
-            last_h: None,
-            peer_ks: None,
+            peer_hostkey: None,
             kex: None,
             pending_keys: None,
             sent_kexinit: false,
             sent_newkeys: false,
             recv_newkeys: false,
-            write_q: VecDeque::new(),
-            current_out: None,
-            current_is_ident: false,
-            write_bytes: 0,
-            write_soft,
-            write_hard,
-            rekey_after_bytes,
-            rekey_after_packets,
-            channels: ChannelTable::new(max_channels),
-            window,
-            max_packet,
-            events: VecDeque::new(),
-            auth_fails: 0,
-            user: None,
-            authed: false,
-            closed: false,
-            kex_blocks_app: false,
             first_kex_done: false,
-            rr: 0,
+            kex_blocks_app: true,
+            authed: false,
+            user: None,
+            auth_fails: 0,
+            auth_ctx: None,
+            window_used: 0,
+            events: VecDeque::new(),
+            closed: false,
+            keepalive_outstanding: 0,
+            server: None,
+            client: None,
+            cfg,
         }
     }
 
-    fn queue_ident(&mut self) {
-        let s = format!("{}\r\n", self.ident_local);
-        self.ident_out = Some(Bytes::from(s.into_bytes()));
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.closed
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.closed && !self.wants_write()
-    }
-
-    pub fn authed(&self) -> bool {
-        self.authed
-    }
-
-    pub fn wants_write(&self) -> bool {
-        self.ident_out.as_ref().is_some_and(|b| !b.is_empty())
-            || self.current_out.as_ref().is_some_and(|b| !b.is_empty())
-            || !self.write_q.is_empty()
-    }
-
-    pub fn queued_write_bytes(&self) -> usize {
-        let ident = if self.current_is_ident {
-            self.current_out.as_ref().map(|b| b.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        self.write_bytes + ident + self.ident_out.as_ref().map(|b| b.len()).unwrap_or(0)
-    }
-
-    fn pull_current_out(&mut self) {
-        if self.current_out.as_ref().is_some_and(|b| b.is_empty()) {
-            self.current_out = None;
-            self.current_is_ident = false;
-        }
-        if self.current_out.is_some() {
-            return;
-        }
-        if let Some(b) = self.ident_out.take() {
-            if !b.is_empty() {
-                self.current_out = Some(b);
-                self.current_is_ident = true;
-                return;
-            }
-        }
-        self.current_is_ident = false;
-        if let Some(b) = self.write_q.pop_front() {
-            self.current_out = Some(b);
-        }
-    }
-
-    pub fn peek_out(&mut self) -> Option<&[u8]> {
-        self.pull_current_out();
-        self.current_out
-            .as_ref()
-            .filter(|b| !b.is_empty())
-            .map(|b| b.as_ref())
-    }
-
-    pub fn consume_out(&mut self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        self.pull_current_out();
-        let Some(b) = self.current_out.as_mut() else {
-            return;
-        };
-        let take = n.min(b.len());
-        let was_ident = self.current_is_ident;
-        if take == b.len() {
-            self.current_out = None;
-            self.current_is_ident = false;
-        } else {
-            let _ = b.split_to(take);
-        }
-        if !was_ident {
-            self.write_bytes = self.write_bytes.saturating_sub(take);
-        }
-        if self.current_out.is_none() && was_ident {
-            self.maybe_start_kex();
-        }
-    }
-
-    fn maybe_start_kex(&mut self) {
-        if !self.sent_kexinit {
+    fn start(&mut self) {
+        let line = format!("{}\r\n", self.ident_local);
+        self.ident_out = Some(Bytes::from(line.into_bytes()));
+        if self.cfg.early_kexinit {
             let _ = self.start_kex();
         }
     }
 
-    pub fn read_buf_mut(&mut self) -> &mut BytesMut {
-        if self.read_buf.capacity() - self.read_buf.len() < 16 * 1024 {
-            self.read_buf.reserve(64 * 1024);
-        }
-        &mut self.read_buf
-    }
+    // ── introspection ──────────────────────────────────────────────────────
 
-    pub fn process_in(&mut self) -> Result<()> {
-        if !self.ident_in_done {
-            self.try_ident()?;
-            if self.ident_in_done {
-                self.maybe_start_kex();
-            } else {
-                return Ok(());
-            }
-        }
-        while self.try_one_packet()? {}
-        self.maybe_rekey();
-        self.flush_pending_all();
-        Ok(())
+    pub fn role(&self) -> Role {
+        self.role
+    }
+    pub fn authed(&self) -> bool {
+        self.authed
+    }
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+    pub fn peer_ident(&self) -> Option<&str> {
+        self.ident_peer.as_deref()
+    }
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+    pub fn active_channels(&self) -> u32 {
+        self.channels.active()
+    }
+    pub fn wants_write(&self) -> bool {
+        self.current.is_some()
+            || !self.write_q.is_empty()
+            || self.ident_out.as_ref().is_some_and(|b| !b.is_empty())
+    }
+    pub fn is_finished(&self) -> bool {
+        self.closed && !self.wants_write()
+    }
+    pub fn queued_out_bytes(&self) -> usize {
+        self.write_bytes
+    }
+    /// Stop reading the transport when true (write backlog too large).
+    pub fn write_saturated(&self) -> bool {
+        self.write_bytes >= self.cfg.out_hard
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {
         self.events.pop_front()
     }
 
-    pub fn peek_inbound(&self, local_id: u32) -> Option<&[u8]> {
-        self.channels
-            .get(local_id)
-            .ok()
-            .and_then(|c| c.in_q.front().map(|b| b.as_ref()))
-    }
+    // ── outbound framing ─────────────────────────────────────────────────────
 
-    pub fn consume_inbound(&mut self, local_id: u32, n: usize) {
-        {
-            let Ok(ch) = self.channels.get_mut(local_id) else {
-                return;
-            };
-            let Some(front) = ch.in_q.front_mut() else {
-                return;
-            };
-            let take = n.min(front.len());
-            if take == front.len() {
-                let b = ch.in_q.pop_front().unwrap();
-                ch.in_q_bytes = ch.in_q_bytes.saturating_sub(b.len());
-            } else {
-                let _ = front.split_to(take);
-                ch.in_q_bytes = ch.in_q_bytes.saturating_sub(take);
+    pub fn peek_out(&mut self) -> Option<&[u8]> {
+        if self.current.as_ref().is_some_and(|(b, _)| b.is_empty()) {
+            self.current = None;
+        }
+        if self.current.is_none() {
+            if let Some(b) = self.ident_out.take() {
+                if !b.is_empty() {
+                    self.current = Some((b, true));
+                }
             }
         }
-        self.maybe_adjust(local_id);
+        if self.current.is_none() {
+            if let Some(b) = self.write_q.pop_front() {
+                self.current = Some((b, false));
+            }
+        }
+        self.current.as_ref().map(|(b, _)| b.as_ref()).filter(|b| !b.is_empty())
     }
 
-    pub fn outbound_allowance(&self, local_id: u32) -> usize {
-        let Ok(ch) = self.channels.get(local_id) else {
-            return 0;
+    pub fn consume_out(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let Some((buf, is_ident)) = self.current.as_mut() else {
+            return;
         };
-        let pend_room = (256 * 1024usize).saturating_sub(ch.pending_out_bytes);
-        if self.kex_blocks_app {
-            return pend_room.min(self.max_packet as usize);
+        let take = n.min(buf.len());
+        let was_ident = *is_ident;
+        if take == buf.len() {
+            self.current = None;
+        } else {
+            let _ = buf.split_to(take);
         }
-        if self.queued_write_bytes() >= self.write_soft {
-            return 0;
+        if !was_ident {
+            self.write_bytes = self.write_bytes.saturating_sub(take);
+        } else if self.current.is_none() && !self.sent_kexinit {
+            // Our identification line just went out; open with KEXINIT.
+            let _ = self.start_kex();
         }
-        ch.outbound_allowance().min(pend_room)
     }
 
-    pub fn send_data(&mut self, local_id: u32, data: &[u8]) -> Result<usize> {
-        if data.is_empty() {
-            return Ok(0);
+    pub fn read_buf_mut(&mut self) -> &mut BytesMut {
+        if self.read_buf.capacity() - self.read_buf.len() < 4096 {
+            self.read_buf.reserve(16 * 1024);
         }
-        let mut sent = 0;
-        while sent < data.len() {
-            let allow = self.outbound_allowance(local_id);
-            if allow == 0 {
-                break;
-            }
-            let n = allow.min(data.len() - sent);
-            let chunk = Bytes::copy_from_slice(&data[sent..sent + n]);
-            self.enqueue_or_send(local_id, chunk)?;
-            sent += n;
-        }
-        Ok(sent)
+        &mut self.read_buf
     }
 
-    pub fn send_eof(&mut self, local_id: u32) -> Result<()> {
-        {
-            let ch = self.channels.get_mut(local_id)?;
-            if ch.sent_eof || ch.sent_close {
-                return Ok(());
-            }
-            ch.sent_eof = true;
-        }
-        self.emit_eof_if_ready(local_id)
-    }
+    // ── inbound framing ──────────────────────────────────────────────────────
 
-    pub fn send_close(&mut self, local_id: u32) -> Result<()> {
-        {
-            let ch = self.channels.get_mut(local_id)?;
-            if ch.sent_close {
+    pub fn process_in(&mut self) -> Result<()> {
+        if !self.ident_done {
+            self.try_ident()?;
+            if !self.ident_done {
                 return Ok(());
             }
-            ch.sent_close = true;
-            ch.sent_eof = true;
-        }
-        self.emit_close_if_ready(local_id)
-    }
-
-    fn emit_eof_if_ready(&mut self, local_id: u32) -> Result<()> {
-        if self.kex_blocks_app {
-            return Ok(());
-        }
-        let remote = {
-            let Ok(ch) = self.channels.get_mut(local_id) else {
-                return Ok(());
-            };
-            if !ch.sent_eof || ch.wire_eof {
-                return Ok(());
+            if !self.sent_kexinit {
+                self.start_kex()?;
             }
-            ch.wire_eof = true;
-            ch.remote_id
-        };
-        if let Some(r) = remote {
-            let mut p = vec![SSH_MSG_CHANNEL_EOF];
-            wire::put_u32(&mut p, r);
-            self.queue_msg(&p, true)?;
         }
+        while self.try_one_packet()? {}
+        self.maybe_rekey();
         Ok(())
-    }
-
-    fn emit_close_if_ready(&mut self, local_id: u32) -> Result<()> {
-        if self.kex_blocks_app {
-            return Ok(());
-        }
-        let remote = {
-            let Ok(ch) = self.channels.get_mut(local_id) else {
-                return Ok(());
-            };
-            if !ch.sent_close {
-                return Ok(());
-            }
-            if ch.wire_close {
-                None
-            } else {
-                ch.wire_close = true;
-                ch.wire_eof = true;
-                ch.remote_id
-            }
-        };
-        if let Some(r) = remote {
-            let mut p = vec![SSH_MSG_CHANNEL_CLOSE];
-            wire::put_u32(&mut p, r);
-            self.queue_msg(&p, true)?;
-        }
-        if self
-            .channels
-            .get(local_id)
-            .map(|c| c.got_close && c.wire_close)
-            .unwrap_or(false)
-        {
-            self.channels.free(local_id);
-        }
-        Ok(())
-    }
-
-    pub fn confirm_open(&mut self, local_id: u32) -> Result<()> {
-        let (remote, window, max_pkt) = {
-            let ch = self.channels.get_mut(local_id)?;
-            ch.open_confirmed = true;
-            (
-                ch.remote_id
-                    .ok_or(Error::protocol("confirm without remote"))?,
-                ch.recv_max,
-                ch.max_local_packet,
-            )
-        };
-        let mut p = vec![SSH_MSG_CHANNEL_OPEN_CONFIRMATION];
-        wire::put_u32(&mut p, remote);
-        wire::put_u32(&mut p, local_id);
-        wire::put_u32(&mut p, window);
-        wire::put_u32(&mut p, max_pkt);
-        self.queue_msg(&p, true)
-    }
-
-    pub fn fail_open(&mut self, local_id: u32, reason: u32, msg: &str) -> Result<()> {
-        let remote = {
-            let ch = self.channels.get(local_id)?;
-            ch.remote_id.ok_or(Error::protocol("fail without remote"))?
-        };
-        let mut p = vec![SSH_MSG_CHANNEL_OPEN_FAILURE];
-        wire::put_u32(&mut p, remote);
-        wire::put_u32(&mut p, reason);
-        wire::put_str(&mut p, msg);
-        wire::put_str(&mut p, "");
-        self.channels.free(local_id);
-        self.queue_msg(&p, true)
-    }
-
-    pub fn open_direct_tcpip(&mut self, host: &str, port: u32) -> Result<u32> {
-        if self.role != Role::Client || !self.authed {
-            return Err(Error::protocol("open_direct before ready"));
-        }
-        let mut ch = Channel::new(
-            0,
-            ChannelKind::DirectTcpIp,
-            self.window,
-            self.max_packet,
-            0,
-            0,
-        );
-        ch.host = Some(host.to_string());
-        ch.port = port;
-        let id = self.channels.alloc(ch)?;
-        let mut p = vec![SSH_MSG_CHANNEL_OPEN];
-        wire::put_str(&mut p, "direct-tcpip");
-        wire::put_u32(&mut p, id);
-        wire::put_u32(&mut p, self.window);
-        wire::put_u32(&mut p, self.max_packet);
-        wire::put_str(&mut p, host);
-        wire::put_u32(&mut p, port);
-        wire::put_str(&mut p, "127.0.0.1");
-        wire::put_u32(&mut p, 0);
-        self.queue_msg(&p, true)?;
-        Ok(id)
-    }
-
-    pub fn channel_kind(&self, id: u32) -> Option<ChannelKind> {
-        self.channels.get(id).ok().map(|c| c.kind)
-    }
-
-    pub fn channel_got_eof(&self, id: u32) -> bool {
-        self.channels.get(id).map(|c| c.got_eof).unwrap_or(true)
-    }
-
-    pub fn channel_alive(&self, id: u32) -> bool {
-        self.channels.get(id).is_ok()
-    }
-
-    pub fn round_robin_ids(&mut self) -> Vec<u32> {
-        let mut ids: Vec<u32> = self.channels.iter_ids().collect();
-        if ids.is_empty() {
-            return ids;
-        }
-        let n = ids.len();
-        let start = (self.rr as usize) % n;
-        self.rr = self.rr.wrapping_add(1);
-        ids.rotate_left(start);
-        ids
-    }
-
-    fn enqueue_or_send(&mut self, local_id: u32, chunk: Bytes) -> Result<()> {
-        let (remote, can_wire, max_pkt, send_window) = {
-            let ch = self.channels.get(local_id)?;
-            (
-                ch.remote_id,
-                ch.open_confirmed && !self.kex_blocks_app && !ch.sent_eof,
-                ch.max_remote_packet,
-                ch.send_window,
-            )
-        };
-        if !can_wire || remote.is_none() || send_window == 0 {
-            let ch = self.channels.get_mut(local_id)?;
-            ch.pending_out_bytes += chunk.len();
-            ch.pending_out.push_back(chunk);
-            return Ok(());
-        }
-        let remote = remote.unwrap();
-        let n = chunk.len().min(max_pkt as usize).min(send_window as usize);
-        if n < chunk.len() {
-            let ch = self.channels.get_mut(local_id)?;
-            let rest = chunk.slice(n..);
-            ch.pending_out.push_front(rest);
-            ch.pending_out_bytes += chunk.len() - n;
-        }
-        {
-            let ch = self.channels.get_mut(local_id)?;
-            ch.send_window -= n as u32;
-        }
-        self.send_channel_data_pkt(remote, &chunk[..n])
-    }
-
-    fn send_channel_data_pkt(&mut self, remote: u32, data: &[u8]) -> Result<()> {
-        let mut p = Vec::with_capacity(9 + data.len());
-        p.push(SSH_MSG_CHANNEL_DATA);
-        wire::put_u32(&mut p, remote);
-        wire::put_bytes(&mut p, data);
-        self.queue_msg(&p, false)
-    }
-
-    fn flush_pending_all(&mut self) {
-        if self.kex_blocks_app {
-            return;
-        }
-        let ids: Vec<u32> = self.channels.iter_ids().collect();
-        for id in ids {
-            self.flush_pending(id);
-        }
-    }
-
-    fn flush_pending(&mut self, local_id: u32) {
-        if self.kex_blocks_app {
-            return;
-        }
-        loop {
-            let (remote, n, max_pkt, window, confirmed, sent_eof) = {
-                let Ok(ch) = self.channels.get(local_id) else {
-                    return;
-                };
-                (
-                    ch.remote_id,
-                    ch.pending_out.front().map(|b| b.len()).unwrap_or(0),
-                    ch.max_remote_packet,
-                    ch.send_window,
-                    ch.open_confirmed,
-                    ch.sent_eof,
-                )
-            };
-            if !confirmed || sent_eof || remote.is_none() || window == 0 || n == 0 {
-                return;
-            }
-            if self.queued_write_bytes() >= self.write_soft {
-                return;
-            }
-            let take = n.min(max_pkt as usize).min(window as usize);
-            let chunk = {
-                let ch = match self.channels.get_mut(local_id) {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                let front = match ch.pending_out.front_mut() {
-                    Some(f) => f,
-                    None => return,
-                };
-                let b = if take >= front.len() {
-                    ch.pending_out.pop_front().unwrap()
-                } else {
-                    front.split_to(take)
-                };
-                ch.pending_out_bytes = ch.pending_out_bytes.saturating_sub(b.len());
-                ch.send_window -= b.len() as u32;
-                b
-            };
-            if self.send_channel_data_pkt(remote.unwrap(), &chunk).is_err() {
-                return;
-            }
-        }
-    }
-
-    fn maybe_adjust(&mut self, local_id: u32) {
-        if self.kex_blocks_app {
-            return;
-        }
-        let (remote, add) = {
-            let Ok(ch) = self.channels.get(local_id) else {
-                return;
-            };
-            (ch.remote_id, ch.window_adjust_amount())
-        };
-        if add == 0 {
-            return;
-        }
-        if let Ok(ch) = self.channels.get_mut(local_id) {
-            ch.recv_window += add;
-        }
-        if let Some(r) = remote {
-            let mut p = vec![SSH_MSG_CHANNEL_WINDOW_ADJUST];
-            wire::put_u32(&mut p, r);
-            wire::put_u32(&mut p, add);
-            let _ = self.queue_msg(&p, true);
-        }
     }
 
     fn try_ident(&mut self) -> Result<()> {
@@ -692,145 +341,414 @@ impl Connection {
             self.ident_acc.extend_from_slice(&self.read_buf);
             self.read_buf.clear();
         }
-        let Some(pos) = self.ident_acc.iter().position(|&b| b == b'\n') else {
-            if self.ident_acc.len() > 255 {
-                return Err(Error::protocol("ident too long"));
+        loop {
+            let Some(pos) = self.ident_acc.iter().position(|&b| b == b'\n') else {
+                if self.ident_acc.len() > 4096 {
+                    return Err(Error::protocol("ident line too long"));
+                }
+                return Ok(());
+            };
+            let mut line: Vec<u8> = self.ident_acc.drain(..=pos).collect();
+            if line.last() == Some(&b'\n') {
+                line.pop();
             }
-            return Ok(());
-        };
-        if pos > 254 {
-            return Err(Error::protocol("ident too long"));
-        }
-        let mut line: Vec<u8> = self.ident_acc.drain(..=pos).collect();
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        let s = std::str::from_utf8(&line).map_err(|_| Error::protocol("ident utf8"))?;
-        if !s.starts_with("SSH-2.0-") && !s.starts_with("SSH-1.99-") {
-            return Err(Error::protocol("unsupported ident"));
-        }
-        self.ident_peer = Some(s.to_string());
-        self.ident_in_done = true;
-        if !self.ident_acc.is_empty() {
-            self.read_buf.extend_from_slice(&self.ident_acc);
-            self.ident_acc.clear();
-        }
-        Ok(())
-    }
-
-    fn start_kex(&mut self) -> Result<()> {
-        let kex_list = match self.role {
-            Role::Server => SERVER_KEX,
-            Role::Client => CLIENT_KEX,
-        };
-        let ours = KexInit::build(kex_list, SERVER_HOST_KEY, SERVER_CIPHERS, SERVER_MACS);
-        self.queue_msg(&ours.raw, true)?;
-        self.sent_kexinit = true;
-        self.sent_newkeys = false;
-        self.recv_newkeys = false;
-        self.kex_blocks_app = true;
-        let mut secret = None;
-        let mut local_pub = None;
-        if self.role == Role::Client {
-            let s = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
-            let p = PublicKey::from(&s);
-            local_pub = Some(*p.as_bytes());
-            secret = Some(s);
-        }
-        self.kex = Some(KexState {
-            ours,
-            theirs: None,
-            secret,
-            local_pub,
-            cipher_c2s: None,
-            cipher_s2c: None,
-        });
-        Ok(())
-    }
-
-    fn maybe_rekey(&mut self) {
-        if !self.authed || !self.first_kex_done || self.closed {
-            return;
-        }
-        if self.kex.is_some() || self.kex_blocks_app || self.sent_kexinit {
-            return;
-        }
-        // Only the server starts rekey. The client still responds to KEXINIT.
-        // Bidirectional initiate on an echo path hits the threshold together
-        // and used to interleave NEWKEYS with already-sealed CHANNEL_DATA.
-        if self.role != Role::Server {
-            return;
-        }
-        if self.bytes_io >= self.rekey_after_bytes || self.packets_io >= self.rekey_after_packets {
-            let _ = self.start_kex();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.starts_with(b"SSH-") {
+                let s = std::str::from_utf8(&line).map_err(|_| Error::protocol("ident utf8"))?;
+                if !s.starts_with("SSH-2.0-") && !s.starts_with("SSH-1.99-") {
+                    return Err(Error::protocol("unsupported SSH version"));
+                }
+                self.ident_peer = Some(s.to_string());
+                self.ident_done = true;
+                if !self.ident_acc.is_empty() {
+                    self.read_buf.extend_from_slice(&self.ident_acc);
+                    self.ident_acc.clear();
+                }
+                return Ok(());
+            }
+            // Pre-banner lines (RFC 4253 §4.2) are ignored.
+            if self.ident_acc.is_empty() && self.read_buf.is_empty() {
+                return Ok(());
+            }
         }
     }
 
     fn try_one_packet(&mut self) -> Result<bool> {
-        if self.read_buf.len() < 4 {
-            return Ok(false);
-        }
-        let enc_len: [u8; 4] = self.read_buf[..4].try_into().unwrap();
-        let plain_len_bytes = self.recv_cipher.decrypt_length(self.recv_seq, enc_len);
-        let length = u32::from_be_bytes(plain_len_bytes);
-        if length < 4 || length as usize > MAX_PACKET {
-            return Err(Error::proto_fmt(format!(
-                "bad packet length {length} seq={} cipher={:?}",
-                self.recv_seq,
-                self.recv_cipher.kind()
-            )));
-        }
-        let tag = self.recv_cipher.kind().tag_len();
-        let total = 4 + length as usize + tag;
+        // Reuse an already-decrypted head from a previous partial read so CTR
+        // keystream is never advanced twice for the same packet.
+        let (length, head, head_len) = if let Some(pf) = self.partial.as_ref() {
+            (pf.length as usize, pf.head, pf.head_len)
+        } else {
+            let head_len = self.recv_cipher.head_len();
+            if self.read_buf.len() < head_len {
+                return Ok(false);
+            }
+            let mut head = [0u8; 16];
+            head[..head_len].copy_from_slice(&self.read_buf[..head_len]);
+            let length =
+                self.recv_cipher.read_length(self.recv_seq, &mut head[..head_len])? as usize;
+            if length < 5 || length > MAX_PACKET {
+                return Err(Error::proto_fmt(format!("bad packet length {length}")));
+            }
+            (length, head, head_len)
+        };
+        let tag = self.recv_cipher.tag_len();
+        let total = 4 + length + tag;
         if self.read_buf.len() < total {
+            if self.partial.is_none() {
+                self.partial = Some(PartialFrame {
+                    length: length as u32,
+                    head,
+                    head_len,
+                });
+            }
             return Ok(false);
         }
+        self.partial = None;
         let mut pkt = self.read_buf.split_to(total);
-        let body_end = 4 + length as usize;
-        {
-            let (body, tagb) = pkt.split_at_mut(body_end);
-            self.recv_cipher.open(self.recv_seq, body, tagb)?;
-            body[..4].copy_from_slice(&plain_len_bytes);
-        }
+        // Restore decrypted head bytes (CTR non-ETM decrypted them above).
+        pkt[..head_len].copy_from_slice(&head[..head_len]);
+        let (body, tagb) = pkt.split_at_mut(4 + length);
+        self.recv_cipher.open(self.recv_seq, body, tagb)?;
         let pad = pkt[4] as usize;
-        if pad < 4 {
+        if pad < 4 || 1 + pad > length {
             return Err(Error::protocol("bad padding"));
         }
-        if 1 + pad >= length as usize {
-            return Err(Error::protocol("padding vs length"));
-        }
-        let payload_end = 4 + length as usize - pad;
-        let mut payload = pkt.split_off(5);
-        payload.truncate(payload_end - 5);
-        let payload = payload.freeze();
+        let pkt = pkt.freeze();
+        let payload = pkt.slice(5..4 + length - pad);
         if payload.is_empty() {
             return Err(Error::protocol("empty payload"));
         }
         self.recv_seq = self.recv_seq.wrapping_add(1);
-        self.bytes_io += total as u64;
-        self.packets_io = self.packets_io.wrapping_add(1);
+        self.bytes_since_kex += total as u64;
         let msg = payload[0];
-        if self.strict_kex && !self.first_kex_done {
-            if is_transport_ignore(msg) {
-                return Err(Error::protocol("strict kex ignore"));
-            }
-            if !is_kex_msg(msg) && msg != SSH_MSG_EXT_INFO {
-                return Err(Error::protocol("strict kex unexpected"));
-            }
+        if self.strict_kex && !self.first_kex_done && !allowed_during_kex(msg) {
+            return Err(Error::protocol("strict-kex violation"));
         }
+        // Strict-kex (Terrapin mitigation) resets the receive sequence number to
+        // zero after *every* NEWKEYS — the initial exchange and every rekey.
+        // OpenSSH does this, so both directions must.
         if msg == SSH_MSG_NEWKEYS && self.strict_kex {
             self.recv_seq = 0;
         }
-        self.handle_payload(payload)?;
+        self.handle(payload)?;
         Ok(true)
     }
 
-    fn handle_payload(&mut self, payload: Bytes) -> Result<()> {
-        let t = payload[0];
-        match t {
+    // ── KEXINIT / KEX ────────────────────────────────────────────────────────
+
+    fn start_kex(&mut self) -> Result<()> {
+        if self.sent_kexinit {
+            return Ok(());
+        }
+        let mut cookie = [0u8; 16];
+        OsRng.fill_bytes(&mut cookie);
+        let kex: Vec<&str> = wire::names(&self.our_kex).collect();
+        let ciphers: Vec<&str> = wire::names(&self.our_ciphers).collect();
+        let macs: Vec<&str> = wire::names(&self.our_macs).collect();
+        let ours = msg::build_kexinit(cookie, &kex, &["ssh-ed25519"], &ciphers, &macs);
+        self.kex = Some(KexRun {
+            ours: ours.clone(),
+            algo: KexAlgo::Curve25519Sha256,
+            cipher_c2s: CipherKind::Clear,
+            cipher_s2c: CipherKind::Clear,
+            mac_c2s: None,
+            mac_s2c: None,
+            hash: HashAlg::Sha256,
+            theirs: Vec::new(),
+            client: None,
+            q_c: Vec::new(),
+        });
+        self.sent_kexinit = true;
+        self.sent_newkeys = false;
+        self.recv_newkeys = false;
+        self.kex_blocks_app = true;
+        self.queue(&ours)
+    }
+
+    fn maybe_rekey(&mut self) {
+        if self.role != Role::Server
+            || !self.first_kex_done
+            || self.kex.is_some()
+            || self.kex_blocks_app
+            || self.sent_kexinit
+            || self.closed
+            || !self.authed
+        {
+            return;
+        }
+        if self.bytes_since_kex >= self.cfg.rekey_bytes {
+            let _ = self.start_kex();
+        }
+    }
+
+    fn on_kexinit(&mut self, payload: &[u8]) -> Result<()> {
+        let theirs = KexInit::parse(payload)?;
+        if self.kex.is_none() {
+            self.start_kex()?;
+        }
+        let (strict, ext) = match self.role {
+            Role::Server => (KEX_STRICT_C, EXT_INFO_C),
+            Role::Client => (KEX_STRICT_S, EXT_INFO_S),
+        };
+        self.strict_kex |= theirs.has(msg::L_KEX, strict);
+        self.peer_ext_info = theirs.has(msg::L_KEX, ext);
+
+        // RFC 4253 §7.1: the client's ordered preference wins each list.
+        let is_server = self.role == Role::Server;
+        let pick = |client: &str, server: &str| -> Option<String> {
+            msg::negotiate(client, server).map(|s| s.to_string())
+        };
+        let (kex_c, kex_s) = if is_server {
+            (theirs.list(msg::L_KEX).to_string(), self.our_kex.clone())
+        } else {
+            (self.our_kex.clone(), theirs.list(msg::L_KEX).to_string())
+        };
+        let (enc_c_client, enc_c_server, enc_s_client, enc_s_server) = if is_server {
+            (
+                theirs.list(msg::L_ENC_C2S).to_string(),
+                self.our_ciphers.clone(),
+                theirs.list(msg::L_ENC_S2C).to_string(),
+                self.our_ciphers.clone(),
+            )
+        } else {
+            (
+                self.our_ciphers.clone(),
+                theirs.list(msg::L_ENC_C2S).to_string(),
+                self.our_ciphers.clone(),
+                theirs.list(msg::L_ENC_S2C).to_string(),
+            )
+        };
+        let (mac_c_client, mac_c_server, mac_s_client, mac_s_server) = if is_server {
+            (
+                theirs.list(msg::L_MAC_C2S).to_string(),
+                self.our_macs.clone(),
+                theirs.list(msg::L_MAC_S2C).to_string(),
+                self.our_macs.clone(),
+            )
+        } else {
+            (
+                self.our_macs.clone(),
+                theirs.list(msg::L_MAC_C2S).to_string(),
+                self.our_macs.clone(),
+                theirs.list(msg::L_MAC_S2C).to_string(),
+            )
+        };
+
+        if !theirs.has(msg::L_HOSTKEY, "ssh-ed25519") {
+            return Err(Error::protocol("no ssh-ed25519 host key"));
+        }
+        let algo = KexAlgo::from_name(&pick(&kex_c, &kex_s).ok_or(Error::protocol("no common kex"))?)
+            .ok_or(Error::protocol("kex algo"))?;
+        let cipher_c2s = CipherKind::from_name(
+            &pick(&enc_c_client, &enc_c_server).ok_or(Error::protocol("no cipher c2s"))?,
+        )
+        .ok_or(Error::protocol("cipher c2s"))?;
+        let cipher_s2c = CipherKind::from_name(
+            &pick(&enc_s_client, &enc_s_server).ok_or(Error::protocol("no cipher s2c"))?,
+        )
+        .ok_or(Error::protocol("cipher s2c"))?;
+        let mac_c2s = if cipher_c2s.is_aead() {
+            None
+        } else {
+            Some(
+                MacKind::from_name(&pick(&mac_c_client, &mac_c_server).ok_or(Error::protocol("no mac c2s"))?)
+                    .ok_or(Error::protocol("mac c2s"))?,
+            )
+        };
+        let mac_s2c = if cipher_s2c.is_aead() {
+            None
+        } else {
+            Some(
+                MacKind::from_name(&pick(&mac_s_client, &mac_s_server).ok_or(Error::protocol("no mac s2c"))?)
+                    .ok_or(Error::protocol("mac s2c"))?,
+            )
+        };
+
+        let run = self.kex.as_mut().ok_or(Error::protocol("kex state"))?;
+        run.algo = algo;
+        run.hash = algo.hash();
+        run.cipher_c2s = cipher_c2s;
+        run.cipher_s2c = cipher_s2c;
+        run.mac_c2s = mac_c2s;
+        run.mac_s2c = mac_s2c;
+        run.theirs = theirs.raw.clone();
+
+        if self.role == Role::Client {
+            let (state, q_c) = ClientKex::start(algo);
+            let run = self.kex.as_mut().unwrap();
+            run.client = Some(state);
+            run.q_c = q_c.clone();
+            let mut p = vec![SSH_MSG_KEX_ECDH_INIT];
+            wire::put_bytes(&mut p, &q_c);
+            self.queue(&p)?;
+        }
+        Ok(())
+    }
+
+    fn on_ecdh_init(&mut self, payload: &[u8]) -> Result<()> {
+        if self.role != Role::Server {
+            return Err(Error::protocol("ecdh init on client"));
+        }
+        let mut p = Parser::new(payload);
+        p.u8()?;
+        let q_c = p.bytes()?.to_vec();
+        let run = self.kex.as_ref().ok_or(Error::protocol("no kex"))?;
+        let algo = run.algo;
+        let hash = run.hash;
+        let theirs = run.theirs.clone();
+        let ours = run.ours.clone();
+        let host = self.server.as_ref().ok_or(Error::protocol("no host key"))?.host_key.public_blob().to_vec();
+        let (q_s, k) = kex::server_exchange(algo, &q_c)?;
+        let v_c = self.ident_peer.clone().ok_or(Error::protocol("no peer ident"))?;
+        let v_s = self.ident_local.clone();
+        let h = exchange_hash(hash, &v_c, &v_s, &theirs, &ours, &host, &q_c, &q_s, &k);
+        let sig = self.server.as_ref().unwrap().host_key.sign(&h);
+        self.peer_hostkey = Some(host.clone());
+        self.derive_and_stage(hash, &k, &h)?;
+        let mut reply = vec![SSH_MSG_KEX_ECDH_REPLY];
+        wire::put_bytes(&mut reply, &host);
+        wire::put_bytes(&mut reply, &q_s);
+        wire::put_bytes(&mut reply, &sig);
+        self.queue(&reply)?;
+        self.send_newkeys()
+    }
+
+    fn on_ecdh_reply(&mut self, payload: &[u8]) -> Result<()> {
+        if self.role != Role::Client {
+            return Err(Error::protocol("ecdh reply on server"));
+        }
+        let mut p = Parser::new(payload);
+        p.u8()?;
+        let host = p.bytes()?.to_vec();
+        let q_s = p.bytes()?.to_vec();
+        let _sig = p.bytes()?;
+        let run = self.kex.as_mut().ok_or(Error::protocol("no kex"))?;
+        let hash = run.hash;
+        let theirs = run.theirs.clone();
+        let ours = run.ours.clone();
+        let client = run.client.take().ok_or(Error::protocol("no client kex"))?;
+        let q_c = std::mem::take(&mut run.q_c);
+        let k = client.finish(&q_s)?;
+        let v_c = self.ident_local.clone();
+        let v_s = self.ident_peer.clone().ok_or(Error::protocol("no peer ident"))?;
+        let h = exchange_hash(hash, &v_c, &v_s, &ours, &theirs, &host, &q_c, &q_s, &k);
+        self.peer_hostkey = Some(host);
+        self.derive_and_stage(hash, &k, &h)?;
+        self.send_newkeys()
+    }
+
+    fn derive_and_stage(&mut self, hash: HashAlg, k: &[u8], h: &[u8]) -> Result<()> {
+        if self.session_id.is_none() {
+            self.session_id = Some(h.to_vec());
+        }
+        let sid = self.session_id.clone().unwrap();
+        let run = self.kex.as_ref().ok_or(Error::protocol("no kex"))?;
+        let (c2s, s2c, mac_c2s, mac_s2c) = (run.cipher_c2s, run.cipher_s2c, run.mac_c2s, run.mac_s2c);
+        let is_server = self.role == Role::Server;
+        // Letters per RFC 4253 §7.2: A/B ivs c2s/s2c, C/D keys c2s/s2c, E/F macs.
+        let mk = |kind: CipherKind, mac: Option<MacKind>, iv_l: u8, key_l: u8, mac_l: u8| -> Result<DirectionKeys> {
+            let mut key = vec![0u8; kind.key_len()];
+            let mut iv = vec![0u8; kind.iv_len()];
+            let mut mac_key = vec![0u8; mac.map(|m| m.key_len()).unwrap_or(0)];
+            if !key.is_empty() {
+                kdf_block(hash, k, h, &sid, key_l, &mut key);
+            }
+            if !iv.is_empty() {
+                kdf_block(hash, k, h, &sid, iv_l, &mut iv);
+            }
+            if !mac_key.is_empty() {
+                kdf_block(hash, k, h, &sid, mac_l, &mut mac_key);
+            }
+            DirectionKeys::new(kind, mac, &key, &iv, &mac_key)
+        };
+        let (send, recv) = if is_server {
+            (
+                mk(s2c, mac_s2c, b'B', b'D', b'F')?,
+                mk(c2s, mac_c2s, b'A', b'C', b'E')?,
+            )
+        } else {
+            (
+                mk(c2s, mac_c2s, b'A', b'C', b'E')?,
+                mk(s2c, mac_s2c, b'B', b'D', b'F')?,
+            )
+        };
+        self.pending_keys = Some(PendingKeys { send, recv });
+        Ok(())
+    }
+
+    fn send_newkeys(&mut self) -> Result<()> {
+        self.queue(&[SSH_MSG_NEWKEYS])?;
+        if let Some(pk) = self.pending_keys.as_mut() {
+            self.send_cipher = std::mem::replace(&mut pk.send, DirectionKeys::Clear);
+        }
+        self.sent_newkeys = true;
+        if self.strict_kex {
+            self.send_seq = 0;
+        }
+        self.try_finish_kex()
+    }
+
+    fn on_newkeys(&mut self) -> Result<()> {
+        let pk = self.pending_keys.take().ok_or(Error::protocol("newkeys without keys"))?;
+        self.recv_cipher = pk.recv;
+        if !self.sent_newkeys {
+            self.pending_keys = Some(PendingKeys {
+                send: pk.send,
+                recv: DirectionKeys::Clear,
+            });
+        }
+        self.recv_newkeys = true;
+        self.try_finish_kex()
+    }
+
+    fn try_finish_kex(&mut self) -> Result<()> {
+        if !self.sent_newkeys || !self.recv_newkeys {
+            return Ok(());
+        }
+        self.kex = None;
+        self.pending_keys = None;
+        self.sent_kexinit = false;
+        self.bytes_since_kex = 0;
+        if !self.first_kex_done {
+            self.first_kex_done = true;
+            self.events.push_back(Event::KexDone);
+            if self.role == Role::Server && self.peer_ext_info {
+                self.send_ext_info()?;
+            }
+            if self.role == Role::Client {
+                let mut p = vec![SSH_MSG_SERVICE_REQUEST];
+                wire::put_str(&mut p, "ssh-userauth");
+                self.queue(&p)?;
+            }
+            // Connection layer stays blocked until userauth success.
+            return Ok(());
+        }
+        // Rekey finished: unblock and flush every channel.
+        self.kex_blocks_app = false;
+        for id in self.channels.ids() {
+            self.flush_channel(id);
+            let _ = self.emit_eof(id);
+            let _ = self.emit_close(id);
+            self.channels.mark(id);
+        }
+        Ok(())
+    }
+
+    fn send_ext_info(&mut self) -> Result<()> {
+        let mut p = vec![SSH_MSG_EXT_INFO];
+        wire::put_u32(&mut p, 1);
+        wire::put_str(&mut p, "server-sig-algs");
+        wire::put_str(&mut p, &crate::pubkey::SIG_ALGS.join(","));
+        self.queue(&p)
+    }
+
+    // ── dispatch ─────────────────────────────────────────────────────────────
+
+    fn handle(&mut self, payload: Bytes) -> Result<()> {
+        match payload[0] {
             SSH_MSG_DISCONNECT => {
                 let mut p = Parser::new(&payload);
                 p.u8()?;
@@ -848,26 +766,25 @@ impl Connection {
             SSH_MSG_EXT_INFO => Ok(()),
             SSH_MSG_SERVICE_REQUEST => self.on_service_request(&payload),
             SSH_MSG_SERVICE_ACCEPT => self.on_service_accept(),
-            SSH_MSG_USERAUTH_REQUEST => self.on_userauth_request(&payload),
-            SSH_MSG_USERAUTH_FAILURE => Err(Error::Auth),
+            SSH_MSG_USERAUTH_REQUEST => self.on_userauth(&payload),
             SSH_MSG_USERAUTH_SUCCESS => {
                 self.authed = true;
-                let user = self
-                    .client
-                    .as_ref()
-                    .map(|c| c.username.clone())
-                    .unwrap_or_default();
-                self.user = Some(user.clone());
                 self.kex_blocks_app = false;
-                self.events.push_back(Event::HandshakeComplete { user });
+                let user = self.client.as_ref().map(|c| c.user.clone()).unwrap_or_default();
+                self.user = Some(user.clone());
+                self.events.push_back(Event::Authenticated { user });
                 Ok(())
             }
+            SSH_MSG_USERAUTH_FAILURE => Err(Error::Auth),
             SSH_MSG_USERAUTH_BANNER => Ok(()),
             SSH_MSG_GLOBAL_REQUEST => self.on_global_request(&payload),
-            SSH_MSG_REQUEST_SUCCESS | SSH_MSG_REQUEST_FAILURE => Ok(()),
+            SSH_MSG_REQUEST_SUCCESS | SSH_MSG_REQUEST_FAILURE => {
+                self.keepalive_outstanding = 0;
+                Ok(())
+            }
             SSH_MSG_CHANNEL_OPEN => self.on_channel_open(&payload),
             SSH_MSG_CHANNEL_OPEN_CONFIRMATION => self.on_open_confirm(&payload),
-            SSH_MSG_CHANNEL_OPEN_FAILURE => self.on_open_fail(&payload),
+            SSH_MSG_CHANNEL_OPEN_FAILURE => self.on_open_failure(&payload),
             SSH_MSG_CHANNEL_WINDOW_ADJUST => self.on_window_adjust(&payload),
             SSH_MSG_CHANNEL_DATA => self.on_channel_data(payload),
             SSH_MSG_CHANNEL_EXTENDED_DATA => self.on_ext_data(&payload),
@@ -875,279 +792,22 @@ impl Connection {
             SSH_MSG_CHANNEL_CLOSE => self.on_channel_close(&payload),
             SSH_MSG_CHANNEL_REQUEST => self.on_channel_request(&payload),
             SSH_MSG_CHANNEL_SUCCESS | SSH_MSG_CHANNEL_FAILURE => Ok(()),
-            SSH_MSG_PING => self.on_ping(&payload),
+            SSH_MSG_PING => {
+                let mut p = Parser::new(&payload);
+                p.u8()?;
+                let data = p.bytes().unwrap_or(b"");
+                let mut m = vec![SSH_MSG_PONG];
+                wire::put_bytes(&mut m, data);
+                self.queue(&m)
+            }
             SSH_MSG_PONG => Ok(()),
-            _ => {
+            other => {
                 let mut p = vec![SSH_MSG_UNIMPLEMENTED];
                 wire::put_u32(&mut p, self.recv_seq.wrapping_sub(1));
-                self.queue_msg(&p, true)
+                let _ = other;
+                self.queue(&p)
             }
         }
-    }
-
-    fn on_kexinit(&mut self, payload: &[u8]) -> Result<()> {
-        let theirs = KexInit::parse(payload)?;
-        if self.kex.is_none() {
-            self.start_kex()?;
-        }
-        let strict_name = match self.role {
-            Role::Server => KEX_STRICT_C,
-            Role::Client => KEX_STRICT_S,
-        };
-        let ext_name = match self.role {
-            Role::Server => EXT_INFO_C,
-            Role::Client => EXT_INFO_S,
-        };
-        let peer_strict = list_has(&theirs.kex, strict_name);
-        let peer_ext = list_has(&theirs.kex, ext_name);
-        {
-            let kex = self.kex.as_mut().unwrap();
-            let c2s = negotiate(SERVER_CIPHERS, &theirs.enc_c2s, false)
-                .ok_or(Error::protocol("no cipher c2s"))?;
-            let s2c = negotiate(SERVER_CIPHERS, &theirs.enc_s2c, false)
-                .ok_or(Error::protocol("no cipher s2c"))?;
-            let host = negotiate(SERVER_HOST_KEY, &theirs.host_key, false)
-                .ok_or(Error::protocol("no host key alg"))?;
-            if host != "ssh-ed25519" {
-                return Err(Error::protocol("host key alg"));
-            }
-            let _ = negotiate(
-                &["curve25519-sha256", "curve25519-sha256@libssh.org"],
-                &theirs.kex,
-                true,
-            )
-            .ok_or(Error::protocol("no kex alg"))?;
-            let _ = negotiate(SERVER_COMP, &theirs.comp_c2s, false)
-                .ok_or(Error::protocol("no compression"))?;
-            kex.cipher_c2s = CipherKind::from_name(&c2s);
-            kex.cipher_s2c = CipherKind::from_name(&s2c);
-            kex.theirs = Some(theirs);
-        }
-        if peer_strict {
-            self.strict_kex = true;
-        }
-        self.peer_ext_info = peer_ext;
-        if self.role == Role::Client {
-            self.send_ecdh_init()?;
-        }
-        Ok(())
-    }
-
-    fn send_ecdh_init(&mut self) -> Result<()> {
-        let q = self
-            .kex
-            .as_ref()
-            .and_then(|k| k.local_pub)
-            .ok_or(Error::protocol("no client ecdh pub"))?;
-        let mut p = vec![SSH_MSG_KEX_ECDH_INIT];
-        wire::put_bytes(&mut p, &q);
-        self.queue_msg(&p, true)
-    }
-
-    fn on_ecdh_init(&mut self, payload: &[u8]) -> Result<()> {
-        if self.role != Role::Server {
-            return Err(Error::protocol("ecdh init as client"));
-        }
-        let mut p = Parser::new(payload);
-        if p.u8()? != SSH_MSG_KEX_ECDH_INIT {
-            return Err(Error::protocol("bad ecdh init"));
-        }
-        let q_c = p.bytes()?;
-        if q_c.len() != 32 {
-            return Err(Error::Crypto("q_c len"));
-        }
-        let mut q_c_arr = [0u8; 32];
-        q_c_arr.copy_from_slice(q_c);
-        let secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
-        let q_s = PublicKey::from(&secret);
-        let q_s_bytes = *q_s.as_bytes();
-        let shared = secret.diffie_hellman(&PublicKey::from(q_c_arr));
-        if is_zero(shared.as_bytes()) {
-            return Err(Error::Crypto("weak shared secret"));
-        }
-        if self.kex.as_ref().and_then(|k| k.theirs.as_ref()).is_none() {
-            return Err(Error::protocol("ecdh before kexinit"));
-        }
-        let host = self.server.as_ref().unwrap().host_key.clone();
-        self.peer_ks = Some(host.public_blob());
-        self.finish_kex(q_c_arr, q_s_bytes, shared.as_bytes())?;
-        let h_now = self.last_h.clone().unwrap();
-        let sig = host.sign(&h_now);
-        let ks = host.public_blob();
-        let mut reply = vec![SSH_MSG_KEX_ECDH_REPLY];
-        wire::put_bytes(&mut reply, &ks);
-        wire::put_bytes(&mut reply, &q_s_bytes);
-        wire::put_bytes(&mut reply, &sig);
-        self.queue_msg(&reply, true)?;
-        self.send_newkeys()
-    }
-
-    fn on_ecdh_reply(&mut self, payload: &[u8]) -> Result<()> {
-        if self.role != Role::Client {
-            return Err(Error::protocol("ecdh reply as server"));
-        }
-        let mut p = Parser::new(payload);
-        if p.u8()? != SSH_MSG_KEX_ECDH_REPLY {
-            return Err(Error::protocol("bad ecdh reply"));
-        }
-        let ks = p.bytes()?.to_vec();
-        let q_s = p.bytes()?;
-        let _sig = p.bytes()?;
-        if q_s.len() != 32 {
-            return Err(Error::Crypto("q_s len"));
-        }
-        let mut q_s_arr = [0u8; 32];
-        q_s_arr.copy_from_slice(q_s);
-        let q_c = self
-            .kex
-            .as_ref()
-            .and_then(|k| k.local_pub)
-            .ok_or(Error::protocol("no client pub"))?;
-        let secret = self
-            .kex
-            .as_mut()
-            .and_then(|k| k.secret.take())
-            .ok_or(Error::protocol("no client secret"))?;
-        let shared = secret.diffie_hellman(&PublicKey::from(q_s_arr));
-        if is_zero(shared.as_bytes()) {
-            return Err(Error::Crypto("weak shared secret"));
-        }
-        self.peer_ks = Some(ks);
-        self.finish_kex(q_c, q_s_arr, shared.as_bytes())?;
-        self.send_newkeys()
-    }
-
-    fn finish_kex(&mut self, q_c: [u8; 32], q_s: [u8; 32], shared: &[u8]) -> Result<()> {
-        let kex = self.kex.as_ref().ok_or(Error::protocol("no kex"))?;
-        let theirs = kex
-            .theirs
-            .as_ref()
-            .ok_or(Error::protocol("no peer kexinit"))?;
-        let (v_c, v_s, i_c, i_s) = match self.role {
-            Role::Server => (
-                self.ident_peer.as_ref().unwrap().as_str(),
-                self.ident_local.as_str(),
-                theirs.raw.as_slice(),
-                kex.ours.raw.as_slice(),
-            ),
-            Role::Client => (
-                self.ident_local.as_str(),
-                self.ident_peer.as_ref().unwrap().as_str(),
-                kex.ours.raw.as_slice(),
-                theirs.raw.as_slice(),
-            ),
-        };
-        let ks = self
-            .peer_ks
-            .as_ref()
-            .ok_or(Error::protocol("no host blob"))?;
-        let k_mpint = wire::encode_mpint(shared);
-        let h = compute_h(v_c, v_s, i_c, i_s, ks, &q_c, &q_s, &k_mpint);
-        if self.session_id.is_none() {
-            self.session_id = Some(h.to_vec());
-        }
-        self.last_h = Some(h.to_vec());
-        let sid = self.session_id.as_ref().unwrap().clone();
-        let c2s = kex.cipher_c2s.ok_or(Error::protocol("no c2s cipher"))?;
-        let s2c = kex.cipher_s2c.ok_or(Error::protocol("no s2c cipher"))?;
-        let is_server = self.role == Role::Server;
-        let (send_kind, recv_kind, send_k, recv_k, send_ivl, recv_ivl) = if is_server {
-            (s2c, c2s, b'D', b'C', b'B', b'A')
-        } else {
-            (c2s, s2c, b'C', b'D', b'A', b'B')
-        };
-        let send = make_keys(&k_mpint, &h, &sid, send_k, send_ivl, send_kind)?;
-        let recv = make_keys(&k_mpint, &h, &sid, recv_k, recv_ivl, recv_kind)?;
-        self.pending_keys = Some(PendingKeys { send, recv });
-        Ok(())
-    }
-
-    fn send_newkeys(&mut self) -> Result<()> {
-        self.queue_msg(&[SSH_MSG_NEWKEYS], true)?;
-        if let Some(pk) = &mut self.pending_keys {
-            self.send_cipher = std::mem::replace(&mut pk.send, DirectionKeys::Clear);
-        }
-        self.sent_newkeys = true;
-        if self.strict_kex {
-            self.send_seq = 0;
-        }
-        tracing::debug!(role = ?self.role, seq = self.send_seq, "sent NEWKEYS");
-        // Do not send EXT_INFO here. OpenSSH keeps Nagle on until auth; if our
-        // first encrypted packet goes out *before* the client's NEWKEYS, the
-        // client then sends NEWKEYS with nothing to piggyback an ACK on and
-        // waits ~40ms for delayed ACK before SERVICE_REQUEST. Send EXT_INFO
-        // after *both* NEWKEYS so it ACKs the client's packet.
-        self.try_complete_kex()
-    }
-
-    fn on_newkeys(&mut self) -> Result<()> {
-        let Some(pk) = self.pending_keys.take() else {
-            return Err(Error::protocol("newkeys without pending"));
-        };
-        self.recv_cipher = pk.recv;
-        // send keys already applied in send_newkeys; if peer NEWKEYS arrives first, send still pending
-        if !self.sent_newkeys {
-            self.pending_keys = Some(PendingKeys {
-                send: pk.send,
-                recv: DirectionKeys::Clear,
-            });
-        }
-        self.recv_newkeys = true;
-        tracing::debug!(role = ?self.role, "recv NEWKEYS");
-        self.try_complete_kex()
-    }
-
-    fn try_complete_kex(&mut self) -> Result<()> {
-        if !self.sent_newkeys || !self.recv_newkeys {
-            return Ok(());
-        }
-        self.kex = None;
-        self.sent_kexinit = false;
-        self.pending_keys = None;
-        self.bytes_io = 0;
-        self.packets_io = 0;
-        if !self.first_kex_done {
-            self.first_kex_done = true;
-            if self.role == Role::Server && self.peer_ext_info {
-                self.send_ext_info()?;
-            }
-            if self.role == Role::Client {
-                self.send_service_request()?;
-            }
-            // Keep kex_blocks_app until userauth success so no CHANNEL_DATA
-            // sneaks out before the connection layer is ready.
-            return Ok(());
-        }
-        self.kex_blocks_app = false;
-        self.flush_post_rekey();
-        // The post-rekey flush must not immediately trip another kex.
-        self.bytes_io = 0;
-        self.packets_io = 0;
-        Ok(())
-    }
-
-    fn flush_post_rekey(&mut self) {
-        let ids: Vec<u32> = self.channels.iter_ids().collect();
-        for id in ids {
-            self.maybe_adjust(id);
-            self.flush_pending(id);
-            let _ = self.emit_eof_if_ready(id);
-            let _ = self.emit_close_if_ready(id);
-        }
-    }
-
-    fn send_ext_info(&mut self) -> Result<()> {
-        let mut p = vec![SSH_MSG_EXT_INFO];
-        wire::put_u32(&mut p, 1);
-        wire::put_str(&mut p, "server-sig-algs");
-        wire::put_str(&mut p, "ssh-ed25519");
-        self.queue_msg(&p, true)
-    }
-
-    fn send_service_request(&mut self) -> Result<()> {
-        let mut p = vec![SSH_MSG_SERVICE_REQUEST];
-        wire::put_str(&mut p, "ssh-userauth");
-        self.queue_msg(&p, true)
     }
 
     fn on_service_request(&mut self, payload: &[u8]) -> Result<()> {
@@ -1158,92 +818,157 @@ impl Connection {
         p.u8()?;
         let name = p.str()?;
         if name != "ssh-userauth" && name != "ssh-connection" {
-            return Err(Error::protocol("unknown service"));
+            self.disconnect(SSH_DISCONNECT_SERVICE_NOT_AVAILABLE, "unknown service");
+            return Ok(());
         }
         let mut r = vec![SSH_MSG_SERVICE_ACCEPT];
         wire::put_str(&mut r, name);
-        self.queue_msg(&r, true)
+        self.queue(&r)
     }
 
     fn on_service_accept(&mut self) -> Result<()> {
         if self.role != Role::Client {
             return Ok(());
         }
-        let cfg = self.client.as_ref().unwrap().clone();
+        let cfg = self.client.as_ref().ok_or(Error::protocol("no client cfg"))?.clone();
         let mut p = vec![SSH_MSG_USERAUTH_REQUEST];
-        wire::put_str(&mut p, &cfg.username);
+        wire::put_str(&mut p, &cfg.user);
         wire::put_str(&mut p, "ssh-connection");
         wire::put_str(&mut p, "password");
         wire::put_bool(&mut p, false);
         wire::put_str(&mut p, &cfg.password);
-        self.queue_msg(&p, true)
+        self.queue(&p)
     }
 
-    fn on_userauth_request(&mut self, payload: &[u8]) -> Result<()> {
-        if self.role != Role::Server {
+    // ── auth (server) ────────────────────────────────────────────────────────
+
+    fn on_userauth(&mut self, payload: &[u8]) -> Result<()> {
+        if self.role != Role::Server || self.authed || self.auth_ctx.is_some() {
             return Ok(());
         }
-        let cfg = self.server.as_ref().unwrap().clone();
         let mut p = Parser::new(payload);
         p.u8()?;
         let user = p.str()?.to_string();
         let service = p.str()?;
         let method = p.str()?;
         if service != "ssh-connection" {
-            return Err(Error::protocol("auth service"));
+            return self.auth_failure();
         }
-        if method == "none" {
-            return self.auth_fail(&cfg);
-        }
-        if method != "password" {
-            return self.auth_fail(&cfg);
-        }
-        let changing = p.bool()?;
-        if changing {
-            return self.auth_fail(&cfg);
-        }
-        let password = p.str()?;
-        if cfg.check_password(&user, password) {
-            self.authed = true;
-            self.user = Some(user.clone());
-            self.kex_blocks_app = false;
-            self.queue_msg(&[SSH_MSG_USERAUTH_SUCCESS], true)?;
-            self.events.push_back(Event::HandshakeComplete { user });
-            Ok(())
-        } else {
-            self.auth_fails += 1;
-            self.auth_fail(&cfg)
+        let methods = self.server.as_ref().map(|s| s.methods).unwrap_or_default();
+        match method {
+            "password" if methods.password => {
+                let changing = p.bool()?;
+                if changing {
+                    return self.auth_failure();
+                }
+                let password = p.str()?.to_string();
+                self.auth_ctx = Some(AuthCtx {
+                    kind: AuthKind::Password,
+                    user: user.clone(),
+                    probe: None,
+                });
+                self.events.push_back(Event::AuthPassword { user, password });
+                Ok(())
+            }
+            "publickey" if methods.publickey && cfg!(feature = "pubkey") => {
+                let has_sig = p.bool()?;
+                let algo = p.str()?.to_string();
+                let key_blob = p.bytes()?.to_vec();
+                if !crate::pubkey::is_supported(&algo) || !crate::pubkey::blob_matches(&algo, &key_blob) {
+                    return self.auth_failure();
+                }
+                if !has_sig {
+                    self.auth_ctx = Some(AuthCtx {
+                        kind: AuthKind::PubkeyProbe,
+                        user: user.clone(),
+                        probe: Some((algo.clone(), key_blob.clone())),
+                    });
+                    self.events.push_back(Event::AuthPublicKeyProbe { user, algo, key_blob });
+                    return Ok(());
+                }
+                let sig = p.bytes()?.to_vec();
+                let signed = self.pubkey_signed_data(&user, &algo, &key_blob);
+                if !crate::pubkey::verify(&algo, &key_blob, &sig, &signed) {
+                    return self.auth_failure();
+                }
+                self.auth_ctx = Some(AuthCtx {
+                    kind: AuthKind::Pubkey,
+                    user: user.clone(),
+                    probe: None,
+                });
+                self.events.push_back(Event::AuthPublicKey { user, algo, key_blob });
+                Ok(())
+            }
+            _ => self.auth_failure(),
         }
     }
 
-    fn auth_fail(&mut self, cfg: &ServerConfig) -> Result<()> {
-        if self.auth_fails >= cfg.max_auth_fails {
-            self.disconnect(
-                SSH_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE,
-                "too many failures",
-            );
+    fn pubkey_signed_data(&self, user: &str, algo: &str, key_blob: &[u8]) -> Vec<u8> {
+        let sid = self.session_id.clone().unwrap_or_default();
+        let mut m = Vec::with_capacity(sid.len() + key_blob.len() + 64);
+        wire::put_bytes(&mut m, &sid);
+        m.push(SSH_MSG_USERAUTH_REQUEST);
+        wire::put_str(&mut m, user);
+        wire::put_str(&mut m, "ssh-connection");
+        wire::put_str(&mut m, "publickey");
+        wire::put_bool(&mut m, true);
+        wire::put_str(&mut m, algo);
+        wire::put_bytes(&mut m, key_blob);
+        m
+    }
+
+    /// Driver's verdict on the pending auth event.
+    pub fn resolve_auth(&mut self, accept: bool) -> Result<()> {
+        let Some(ctx) = self.auth_ctx.take() else {
+            return Ok(());
+        };
+        if !accept {
+            return self.auth_failure();
+        }
+        match ctx.kind {
+            AuthKind::PubkeyProbe => {
+                // PK_OK: this key is acceptable; the client re-sends with a signature.
+                let (algo, blob) = ctx.probe.unwrap_or_default();
+                let mut p = vec![SSH_MSG_USERAUTH_PK_OK];
+                wire::put_str(&mut p, &algo);
+                wire::put_bytes(&mut p, &blob);
+                self.queue(&p)
+            }
+            AuthKind::Password | AuthKind::Pubkey => {
+                self.authed = true;
+                self.kex_blocks_app = false;
+                self.user = Some(ctx.user.clone());
+                self.queue(&[SSH_MSG_USERAUTH_SUCCESS])?;
+                self.events.push_back(Event::Authenticated { user: ctx.user });
+                Ok(())
+            }
+        }
+    }
+
+    fn auth_failure(&mut self) -> Result<()> {
+        self.auth_ctx = None;
+        self.auth_fails += 1;
+        if self.auth_fails >= self.cfg.max_auth_attempts {
+            self.disconnect(SSH_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE, "too many failures");
             return Ok(());
         }
+        let methods = self.server.as_ref().map(|s| s.methods.namelist()).unwrap_or("");
         let mut p = vec![SSH_MSG_USERAUTH_FAILURE];
-        wire::put_str(&mut p, "password");
+        wire::put_str(&mut p, methods);
         wire::put_bool(&mut p, false);
-        self.queue_msg(&p, true)
+        self.queue(&p)
     }
+
+    // ── connection layer ───────────────────────────────────────────────────
 
     fn on_global_request(&mut self, payload: &[u8]) -> Result<()> {
         let mut p = Parser::new(payload);
         p.u8()?;
-        let name = p.str().unwrap_or("");
+        let _name = p.str().unwrap_or("");
         let want = p.bool().unwrap_or(false);
         if want {
-            if name == "keepalive@openssh.com"
-                || name == "no-more-sessions@openssh.com"
-                || name == "ping@openssh.com"
-            {
-                self.queue_msg(&[SSH_MSG_REQUEST_SUCCESS], true)?;
-            } else {
-                self.queue_msg(&[SSH_MSG_REQUEST_FAILURE], true)?;
-            }
+            // We refuse reverse forwarding and every other global request.
+            self.queue(&[SSH_MSG_REQUEST_FAILURE])?;
         }
         Ok(())
     }
@@ -1254,55 +979,90 @@ impl Connection {
         }
         let mut p = Parser::new(payload);
         p.u8()?;
-        let typ = p.str()?;
+        let typ = p.str()?.to_string();
         let remote = p.u32()?;
         let send_window = p.u32()?;
-        let max_remote_packet = p.u32()?;
-        match typ {
+        let peer_max_packet = p.u32()?.min(MAX_PACKET as u32);
+        let refuse = |me: &mut Self, reason: u32, msg: &str| -> Result<()> {
+            let mut f = vec![SSH_MSG_CHANNEL_OPEN_FAILURE];
+            wire::put_u32(&mut f, remote);
+            wire::put_u32(&mut f, reason);
+            wire::put_str(&mut f, msg);
+            wire::put_str(&mut f, "");
+            me.queue(&f)
+        };
+        if self.channels.is_full() {
+            return refuse(self, SSH_OPEN_RESOURCE_SHORTAGE, "too many channels");
+        }
+        let window = self.next_window();
+        if window == 0 {
+            return refuse(self, SSH_OPEN_RESOURCE_SHORTAGE, "window budget");
+        }
+        match typ.as_str() {
             "session" => {
-                let mut ch = Channel::new(
-                    0,
-                    ChannelKind::Session,
-                    self.window,
-                    self.max_packet,
-                    send_window,
-                    max_remote_packet,
-                );
+                let accept = self.server.as_ref().map(|s| s.accept_session_channels).unwrap_or(false);
+                if !accept {
+                    return refuse(self, SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, "no session");
+                }
+                let mut ch = Channel::new(ChannelKind::Session, window, self.cfg.max_packet, send_window, peer_max_packet);
                 ch.remote_id = Some(remote);
-                let id = self.channels.alloc(ch)?;
+                let id = self.channels.alloc(ch).unwrap();
+                self.window_used += window as u64;
                 self.events.push_back(Event::OpenSession { local_id: id });
             }
             "direct-tcpip" => {
                 let host = p.str()?.to_string();
                 let port = p.u32()?;
-                let _orig = p.str()?;
-                let _oport = p.u32()?;
-                let mut ch = Channel::new(
-                    0,
-                    ChannelKind::DirectTcpIp,
-                    self.window,
-                    self.max_packet,
-                    send_window,
-                    max_remote_packet,
-                );
+                let port: u16 = match port.try_into() {
+                    Ok(p) => p,
+                    Err(_) => return refuse(self, SSH_OPEN_CONNECT_FAILED, "bad port"),
+                };
+                let mut ch = Channel::new(ChannelKind::DirectTcpIp, window, self.cfg.max_packet, send_window, peer_max_packet);
                 ch.remote_id = Some(remote);
                 ch.host = Some(host.clone());
                 ch.port = port;
-                let id = self.channels.alloc(ch)?;
-                self.events.push_back(Event::OpenDirectTcpIp {
-                    local_id: id,
-                    host,
-                    port,
-                });
+                let id = self.channels.alloc(ch).unwrap();
+                self.window_used += window as u64;
+                self.events.push_back(Event::OpenDirectTcpIp { local_id: id, host, port });
             }
-            _ => {
-                let mut f = vec![SSH_MSG_CHANNEL_OPEN_FAILURE];
-                wire::put_u32(&mut f, remote);
-                wire::put_u32(&mut f, SSH_OPEN_UNKNOWN_CHANNEL_TYPE);
-                wire::put_str(&mut f, "unknown channel type");
-                wire::put_str(&mut f, "");
-                self.queue_msg(&f, true)?;
-            }
+            _ => return refuse(self, SSH_OPEN_UNKNOWN_CHANNEL_TYPE, "unknown"),
+        }
+        Ok(())
+    }
+
+    fn next_window(&self) -> u32 {
+        let room = self.cfg.window_budget.saturating_sub(self.window_used);
+        (self.cfg.window_initial as u64).min(room) as u32
+    }
+
+    /// Confirm a channel the driver accepted.
+    pub fn accept_channel(&mut self, id: u32) -> Result<()> {
+        let (remote, window, max_pkt) = {
+            let ch = self.channels.get_mut(id).ok_or(Error::protocol("no channel"))?;
+            ch.open_confirmed = true;
+            (ch.remote_id.ok_or(Error::protocol("no remote id"))?, ch.recv_max, ch.local_max_packet)
+        };
+        let mut m = vec![SSH_MSG_CHANNEL_OPEN_CONFIRMATION];
+        wire::put_u32(&mut m, remote);
+        wire::put_u32(&mut m, id);
+        wire::put_u32(&mut m, window);
+        wire::put_u32(&mut m, max_pkt);
+        self.queue(&m)
+    }
+
+    /// Refuse a channel the driver rejected.
+    pub fn reject_channel(&mut self, id: u32, reason: u32, msg: &str) -> Result<()> {
+        let remote = self.channels.get(id).and_then(|c| c.remote_id);
+        let window = self.channels.get(id).map(|c| c.recv_max as u64).unwrap_or(0);
+        self.window_used = self.window_used.saturating_sub(window);
+        self.channels.free(id);
+        if let Some(remote) = remote {
+            let mut f = vec![SSH_MSG_CHANNEL_OPEN_FAILURE];
+            wire::put_u32(&mut f, remote);
+            wire::put_u32(&mut f, reason);
+            wire::put_str(&mut f, msg);
+            wire::put_str(&mut f, "");
+            self.queue(&f)?;
         }
         Ok(())
     }
@@ -1313,32 +1073,28 @@ impl Connection {
         let local = p.u32()?;
         let remote = p.u32()?;
         let window = p.u32()?;
-        let max_pkt = p.u32()?;
-        {
-            let ch = self.channels.get_mut(local)?;
+        let max_pkt = p.u32()?.min(MAX_PACKET as u32);
+        if let Some(ch) = self.channels.get_mut(local) {
             ch.remote_id = Some(remote);
             ch.send_window = window;
-            ch.max_remote_packet = max_pkt;
+            ch.peer_max_packet = max_pkt;
             ch.open_confirmed = true;
         }
-        self.events
-            .push_back(Event::ChannelOpenConfirmation { local_id: local });
-        self.flush_pending(local);
+        self.flush_channel(local);
+        self.events.push_back(Event::OpenConfirmed { local_id: local });
         Ok(())
     }
 
-    fn on_open_fail(&mut self, payload: &[u8]) -> Result<()> {
+    fn on_open_failure(&mut self, payload: &[u8]) -> Result<()> {
         let mut p = Parser::new(payload);
         p.u8()?;
         let local = p.u32()?;
         let reason = p.u32()?;
         let message = p.str().unwrap_or("").to_string();
+        let window = self.channels.get(local).map(|c| c.recv_max as u64).unwrap_or(0);
+        self.window_used = self.window_used.saturating_sub(window);
         self.channels.free(local);
-        self.events.push_back(Event::ChannelOpenFailure {
-            local_id: local,
-            reason,
-            message,
-        });
+        self.events.push_back(Event::OpenFailed { local_id: local, reason, message });
         Ok(())
     }
 
@@ -1347,11 +1103,11 @@ impl Connection {
         p.u8()?;
         let local = p.u32()?;
         let add = p.u32()?;
-        {
-            let ch = self.channels.get_mut(local)?;
+        if let Some(ch) = self.channels.get_mut(local) {
             ch.send_window = ch.send_window.saturating_add(add);
         }
-        self.flush_pending(local);
+        self.flush_channel(local);
+        self.events.push_back(Event::ChannelWindow { local_id: local });
         Ok(())
     }
 
@@ -1365,9 +1121,15 @@ impl Connection {
             return Err(Error::protocol("truncated channel data"));
         }
         let data = payload.slice(9..9 + dlen);
-        self.channels.get_mut(local)?.push_in(data)?;
-        self.events
-            .push_back(Event::ChannelData { local_id: local });
+        if let Some(ch) = self.channels.get_mut(local) {
+            if dlen as u32 > ch.recv_window {
+                return Err(Error::protocol("window exceeded"));
+            }
+            ch.recv_window -= dlen as u32;
+            ch.in_q_bytes += dlen;
+            ch.in_q.push_back(data);
+            self.events.push_back(Event::ChannelData { local_id: local });
+        }
         Ok(())
     }
 
@@ -1377,9 +1139,16 @@ impl Connection {
         let local = p.u32()?;
         let _code = p.u32()?;
         let data = Bytes::copy_from_slice(p.bytes()?);
-        self.channels.get_mut(local)?.push_in(data)?;
-        self.events
-            .push_back(Event::ChannelData { local_id: local });
+        if let Some(ch) = self.channels.get_mut(local) {
+            let dlen = data.len();
+            if dlen as u32 > ch.recv_window {
+                return Err(Error::protocol("window exceeded"));
+            }
+            ch.recv_window -= dlen as u32;
+            ch.in_q_bytes += dlen;
+            ch.in_q.push_back(data);
+            self.events.push_back(Event::ChannelData { local_id: local });
+        }
         Ok(())
     }
 
@@ -1387,7 +1156,7 @@ impl Connection {
         let mut p = Parser::new(payload);
         p.u8()?;
         let local = p.u32()?;
-        if let Ok(ch) = self.channels.get_mut(local) {
+        if let Some(ch) = self.channels.get_mut(local) {
             ch.got_eof = true;
         }
         self.events.push_back(Event::ChannelEof { local_id: local });
@@ -1398,22 +1167,20 @@ impl Connection {
         let mut p = Parser::new(payload);
         p.u8()?;
         let local = p.u32()?;
-        let already_sent = {
-            if let Ok(ch) = self.channels.get_mut(local) {
+        let already = match self.channels.get_mut(local) {
+            Some(ch) => {
                 ch.got_close = true;
                 ch.got_eof = true;
                 ch.sent_close
-            } else {
-                return Ok(());
             }
+            None => return Ok(()),
         };
-        if !already_sent {
-            let _ = self.send_close(local);
+        if already {
+            self.finalize_channel(local);
         } else {
-            let _ = self.emit_close_if_ready(local);
+            let _ = self.send_close(local);
         }
-        self.events
-            .push_back(Event::ChannelClose { local_id: local });
+        self.events.push_back(Event::ChannelClose { local_id: local });
         Ok(())
     }
 
@@ -1421,41 +1188,347 @@ impl Connection {
         let mut p = Parser::new(payload);
         p.u8()?;
         let local = p.u32()?;
-        let name = p.str().unwrap_or("");
+        let _name = p.str().unwrap_or("");
         let want = p.bool().unwrap_or(false);
-        if !want {
-            return Ok(());
+        if want {
+            if let Some(remote) = self.channels.get(local).and_then(|c| c.remote_id) {
+                // We support no channel requests (no shell/pty/exec).
+                let mut m = vec![SSH_MSG_CHANNEL_FAILURE];
+                wire::put_u32(&mut m, remote);
+                self.queue(&m)?;
+            }
         }
-        let remote = self.channels.get(local).ok().and_then(|c| c.remote_id);
-        let Some(r) = remote else {
-            return Ok(());
-        };
-        let ok = matches!(
-            name,
-            "pty-req"
-                | "env"
-                | "shell"
-                | "window-change"
-                | "eow@openssh.com"
-                | "keepalive@openssh.com"
-                | "simple@putty.projects.tartarus.org"
-        );
-        let mut m = vec![if ok {
-            SSH_MSG_CHANNEL_SUCCESS
-        } else {
-            SSH_MSG_CHANNEL_FAILURE
-        }];
-        wire::put_u32(&mut m, r);
-        self.queue_msg(&m, true)
+        Ok(())
     }
 
-    fn on_ping(&mut self, payload: &[u8]) -> Result<()> {
-        let mut p = Parser::new(payload);
-        p.u8()?;
-        let data = p.bytes().unwrap_or(b"");
-        let mut m = vec![SSH_MSG_PONG];
-        wire::put_bytes(&mut m, data);
-        self.queue_msg(&m, true)
+    // ── channel data plane API (driver side) ─────────────────────────────────
+
+    /// Peer bytes waiting to be handed to the application.
+    pub fn inbound_front(&self, id: u32) -> Option<&[u8]> {
+        self.channels.get(id).and_then(|c| c.in_q.front().map(|b| b.as_ref()))
+    }
+
+    pub fn consume_inbound(&mut self, id: u32, n: usize) {
+        let budget_room = {
+            let Some(ch) = self.channels.get_mut(id) else {
+                return;
+            };
+            let Some(front) = ch.in_q.front_mut() else {
+                return;
+            };
+            let take = n.min(front.len());
+            if take == front.len() {
+                let b = ch.in_q.pop_front().unwrap();
+                ch.in_q_bytes -= b.len();
+            } else {
+                let _ = front.split_to(take);
+                ch.in_q_bytes -= take;
+            }
+            self.cfg.window_max.saturating_sub(ch.recv_max)
+        };
+        self.maybe_adjust_window(id, budget_room);
+    }
+
+    fn maybe_adjust_window(&mut self, id: u32, budget_room: u32) {
+        if self.kex_blocks_app {
+            return;
+        }
+        let (remote, add) = {
+            let Some(ch) = self.channels.get(id) else {
+                return;
+            };
+            (ch.remote_id, ch.window_adjust(budget_room))
+        };
+        if add == 0 {
+            return;
+        }
+        if let Some(ch) = self.channels.get_mut(id) {
+            ch.recv_window += add;
+        }
+        if let Some(r) = remote {
+            let mut m = vec![SSH_MSG_CHANNEL_WINDOW_ADJUST];
+            wire::put_u32(&mut m, r);
+            wire::put_u32(&mut m, add);
+            let _ = self.queue(&m);
+        }
+    }
+
+    /// How much application data we may hand to `send_data` right now.
+    pub fn send_capacity(&self, id: u32) -> usize {
+        if self.write_bytes >= self.cfg.out_soft && !self.kex_blocks_app {
+            return 0;
+        }
+        let Some(ch) = self.channels.get(id) else {
+            return 0;
+        };
+        if !ch.can_send() {
+            return 0;
+        }
+        if self.kex_blocks_app {
+            // During rekey we may buffer up to one packet per channel.
+            return (self.cfg.max_packet as usize).saturating_sub(ch.pending_out_bytes);
+        }
+        (ch.send_window as usize).min(ch.peer_max_packet as usize)
+    }
+
+    pub fn send_data(&mut self, id: u32, data: &[u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let mut sent = 0;
+        loop {
+            let cap = self.send_capacity(id);
+            if cap == 0 || sent >= data.len() {
+                break;
+            }
+            let n = cap.min(data.len() - sent);
+            let chunk = Bytes::copy_from_slice(&data[sent..sent + n]);
+            self.enqueue_out(id, chunk)?;
+            sent += n;
+        }
+        Ok(sent)
+    }
+
+    fn enqueue_out(&mut self, id: u32, chunk: Bytes) -> Result<()> {
+        let (remote, wire_now, max_pkt, window) = {
+            let Some(ch) = self.channels.get(id) else {
+                return Ok(());
+            };
+            (
+                ch.remote_id,
+                ch.can_send() && !self.kex_blocks_app,
+                ch.peer_max_packet,
+                ch.send_window,
+            )
+        };
+        if !wire_now || remote.is_none() || window == 0 {
+            if let Some(ch) = self.channels.get_mut(id) {
+                ch.pending_out_bytes += chunk.len();
+                ch.pending_out.push_back(chunk);
+            }
+            return Ok(());
+        }
+        let n = chunk.len().min(max_pkt as usize).min(window as usize);
+        if n < chunk.len() {
+            if let Some(ch) = self.channels.get_mut(id) {
+                ch.pending_out.push_front(chunk.slice(n..));
+                ch.pending_out_bytes += chunk.len() - n;
+            }
+        }
+        if let Some(ch) = self.channels.get_mut(id) {
+            ch.send_window -= n as u32;
+        }
+        self.send_channel_data(remote.unwrap(), &chunk[..n])
+    }
+
+    fn send_channel_data(&mut self, remote: u32, data: &[u8]) -> Result<()> {
+        let mut p = Vec::with_capacity(9 + data.len());
+        p.push(SSH_MSG_CHANNEL_DATA);
+        wire::put_u32(&mut p, remote);
+        wire::put_bytes(&mut p, data);
+        self.queue(&p)
+    }
+
+    fn flush_channel(&mut self, id: u32) {
+        if self.kex_blocks_app {
+            return;
+        }
+        loop {
+            let (remote, len, max_pkt, window, can) = {
+                let Some(ch) = self.channels.get(id) else {
+                    return;
+                };
+                (
+                    ch.remote_id,
+                    ch.pending_out.front().map(|b| b.len()).unwrap_or(0),
+                    ch.peer_max_packet,
+                    ch.send_window,
+                    ch.can_send(),
+                )
+            };
+            if !can || remote.is_none() || window == 0 || len == 0 || self.write_bytes >= self.cfg.out_soft {
+                return;
+            }
+            let take = len.min(max_pkt as usize).min(window as usize);
+            let chunk = {
+                let ch = self.channels.get_mut(id).unwrap();
+                let front = ch.pending_out.front_mut().unwrap();
+                let b = if take >= front.len() {
+                    ch.pending_out.pop_front().unwrap()
+                } else {
+                    front.split_to(take)
+                };
+                ch.pending_out_bytes -= b.len();
+                ch.send_window -= b.len() as u32;
+                b
+            };
+            if self.send_channel_data(remote.unwrap(), &chunk).is_err() {
+                return;
+            }
+        }
+    }
+
+    pub fn open_direct_tcpip(&mut self, host: &str, port: u16) -> Result<u32> {
+        if self.role != Role::Client || !self.authed {
+            return Err(Error::protocol("open before ready"));
+        }
+        let window = self.next_window();
+        let mut ch = Channel::new(ChannelKind::DirectTcpIp, window, self.cfg.max_packet, 0, 0);
+        ch.host = Some(host.to_string());
+        ch.port = port;
+        let id = self.channels.alloc(ch).ok_or(Error::protocol("too many channels"))?;
+        self.window_used += window as u64;
+        let mut p = vec![SSH_MSG_CHANNEL_OPEN];
+        wire::put_str(&mut p, "direct-tcpip");
+        wire::put_u32(&mut p, id);
+        wire::put_u32(&mut p, window);
+        wire::put_u32(&mut p, self.cfg.max_packet);
+        wire::put_str(&mut p, host);
+        wire::put_u32(&mut p, port as u32);
+        wire::put_str(&mut p, "127.0.0.1");
+        wire::put_u32(&mut p, 0);
+        self.queue(&p)?;
+        Ok(id)
+    }
+
+    pub fn send_eof(&mut self, id: u32) -> Result<()> {
+        {
+            let Some(ch) = self.channels.get_mut(id) else {
+                return Ok(());
+            };
+            if ch.sent_eof || ch.sent_close {
+                return Ok(());
+            }
+            ch.sent_eof = true;
+        }
+        self.emit_eof(id)
+    }
+
+    pub fn send_close(&mut self, id: u32) -> Result<()> {
+        {
+            let Some(ch) = self.channels.get_mut(id) else {
+                return Ok(());
+            };
+            if ch.sent_close {
+                return Ok(());
+            }
+            ch.sent_close = true;
+            ch.sent_eof = true;
+        }
+        self.emit_close(id)
+    }
+
+    fn emit_eof(&mut self, id: u32) -> Result<()> {
+        if self.kex_blocks_app {
+            return Ok(());
+        }
+        let remote = {
+            let Some(ch) = self.channels.get_mut(id) else {
+                return Ok(());
+            };
+            if !ch.sent_eof || ch.wire_eof || !ch.pending_out.is_empty() {
+                return Ok(());
+            }
+            ch.wire_eof = true;
+            ch.remote_id
+        };
+        if let Some(r) = remote {
+            let mut p = vec![SSH_MSG_CHANNEL_EOF];
+            wire::put_u32(&mut p, r);
+            self.queue(&p)?;
+        }
+        Ok(())
+    }
+
+    fn emit_close(&mut self, id: u32) -> Result<()> {
+        if self.kex_blocks_app {
+            return Ok(());
+        }
+        let remote = {
+            let Some(ch) = self.channels.get_mut(id) else {
+                return Ok(());
+            };
+            if !ch.sent_close || ch.wire_close || !ch.pending_out.is_empty() {
+                return Ok(());
+            }
+            ch.wire_close = true;
+            ch.wire_eof = true;
+            ch.remote_id
+        };
+        if let Some(r) = remote {
+            let mut p = vec![SSH_MSG_CHANNEL_CLOSE];
+            wire::put_u32(&mut p, r);
+            self.queue(&p)?;
+        }
+        self.finalize_channel(id);
+        Ok(())
+    }
+
+    fn finalize_channel(&mut self, id: u32) {
+        let done = self
+            .channels
+            .get(id)
+            .map(|c| c.got_close && c.wire_close)
+            .unwrap_or(false);
+        if done {
+            let window = self.channels.get(id).map(|c| c.recv_max as u64).unwrap_or(0);
+            self.window_used = self.window_used.saturating_sub(window);
+            self.channels.free(id);
+        }
+    }
+
+    pub fn channel_alive(&self, id: u32) -> bool {
+        self.channels.get(id).is_some()
+    }
+    pub fn channel_kind(&self, id: u32) -> Option<ChannelKind> {
+        self.channels.get(id).map(|c| c.kind)
+    }
+    pub fn channel_got_eof(&self, id: u32) -> bool {
+        self.channels.get(id).map(|c| c.got_eof).unwrap_or(true)
+    }
+    pub fn next_dirty(&mut self) -> Option<u32> {
+        self.channels.next_dirty()
+    }
+
+    /// Debug snapshot: (kex_blocks_app, needs_kex, send_window, pending_out, recv_window, in_q).
+    pub fn dbg_channel(&self, id: u32) -> (bool, bool, u32, usize, u32, usize) {
+        let ch = self.channels.get(id);
+        (
+            self.kex_blocks_app,
+            self.kex.is_some() || self.sent_kexinit,
+            ch.map(|c| c.send_window).unwrap_or(0),
+            ch.map(|c| c.pending_out_bytes).unwrap_or(0),
+            ch.map(|c| c.recv_window).unwrap_or(0),
+            ch.map(|c| c.in_q_bytes).unwrap_or(0),
+        )
+    }
+
+    // ── timers / keepalive ───────────────────────────────────────────────────
+
+    pub fn needs_kex(&self) -> bool {
+        self.kex.is_some() || !self.first_kex_done
+    }
+
+    /// Force a key exchange (test/manual). No-op if one is already running or
+    /// the first exchange has not completed.
+    pub fn trigger_rekey(&mut self) -> Result<()> {
+        if self.first_kex_done && self.kex.is_none() && !self.sent_kexinit && !self.closed {
+            self.start_kex()?;
+        }
+        Ok(())
+    }
+
+    /// Send a keepalive global request; returns false if the budget is spent.
+    pub fn send_keepalive(&mut self) -> Result<bool> {
+        if self.keepalive_outstanding >= self.cfg.keepalive_max {
+            return Ok(false);
+        }
+        self.keepalive_outstanding += 1;
+        let mut p = vec![SSH_MSG_GLOBAL_REQUEST];
+        wire::put_str(&mut p, "keepalive@openssh.com");
+        wire::put_bool(&mut p, true);
+        self.queue(&p)?;
+        Ok(true)
     }
 
     pub fn disconnect(&mut self, reason: u32, msg: &str) {
@@ -1466,67 +1539,54 @@ impl Connection {
         wire::put_u32(&mut p, reason);
         wire::put_str(&mut p, msg);
         wire::put_str(&mut p, "");
-        let _ = self.queue_msg(&p, true);
+        let _ = self.queue(&p);
         self.closed = true;
-        self.events.push_back(Event::Disconnect {
-            reason,
-            message: msg.into(),
-        });
     }
 
-    fn queue_msg(&mut self, payload: &[u8], priority: bool) -> Result<()> {
+    // ── low-level packet sealing ─────────────────────────────────────────────
+
+    fn queue(&mut self, payload: &[u8]) -> Result<()> {
         if payload.is_empty() {
-            return Err(Error::protocol("empty msg"));
+            return Err(Error::protocol("empty payload"));
         }
-        if !priority && self.write_bytes >= self.write_hard {
-            return Err(Error::protocol("write backlog"));
-        }
-        let kind = self.send_cipher.kind();
-        let block = kind.block_size();
-        let tag = kind.tag_len();
-        let pad = padding_len(payload.len(), block, kind.is_aead());
-        let packet_length = 1 + payload.len() + pad;
-        let total = 4 + packet_length + tag;
-        let mut buf = BytesMut::with_capacity(total);
-        buf.resize(total, 0);
-        buf[..4].copy_from_slice(&(packet_length as u32).to_be_bytes());
+        let block = self.send_cipher.block_size();
+        let tag = self.send_cipher.tag_len();
+        let aad = self.send_cipher.length_is_aad();
+        let pad = padding_len(payload.len(), block, aad);
+        let plen = 1 + payload.len() + pad;
+        let total = 4 + plen + tag;
+        let mut buf = BytesMut::zeroed(total);
+        buf[..4].copy_from_slice(&(plen as u32).to_be_bytes());
         buf[4] = pad as u8;
         buf[5..5 + payload.len()].copy_from_slice(payload);
-        rand::rngs::OsRng.fill_bytes(&mut buf[5 + payload.len()..5 + payload.len() + pad]);
-        {
-            let (pkt, tag_out) = buf.split_at_mut(4 + packet_length);
-            self.send_cipher.seal(self.send_seq, pkt, tag_out)?;
-        }
+        OsRng.fill_bytes(&mut buf[5 + payload.len()..5 + payload.len() + pad]);
+        let (pkt, tag_out) = buf.split_at_mut(4 + plen);
+        self.send_cipher.seal(self.send_seq, pkt, tag_out)?;
         self.send_seq = self.send_seq.wrapping_add(1);
-        self.bytes_io += total as u64;
-        self.packets_io = self.packets_io.wrapping_add(1);
+        self.bytes_since_kex += total as u64;
         let frozen = buf.freeze();
         self.write_bytes += frozen.len();
-        let _ = priority;
         self.write_q.push_back(frozen);
         Ok(())
     }
 }
 
-fn is_zero(b: &[u8]) -> bool {
-    let mut acc = 0u8;
-    for x in b {
-        acc |= *x;
-    }
-    acc == 0
+fn kdf_block(hash: HashAlg, k: &[u8], h: &[u8], sid: &[u8], letter: u8, out: &mut [u8]) {
+    crate::crypto::kdf::derive(hash, k, h, sid, letter, out);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_h(
+fn exchange_hash(
+    hash: HashAlg,
     v_c: &str,
     v_s: &str,
     i_c: &[u8],
     i_s: &[u8],
     k_s: &[u8],
-    q_c: &[u8; 32],
-    q_s: &[u8; 32],
-    k_mpint: &[u8],
-) -> [u8; 32] {
+    q_c: &[u8],
+    q_s: &[u8],
+    k: &[u8],
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256 + i_c.len() + i_s.len());
     wire::put_str(&mut buf, v_c);
     wire::put_str(&mut buf, v_s);
@@ -1535,248 +1595,6 @@ fn compute_h(
     wire::put_bytes(&mut buf, k_s);
     wire::put_bytes(&mut buf, q_c);
     wire::put_bytes(&mut buf, q_s);
-    buf.extend_from_slice(k_mpint);
-    Sha256::digest(&buf).into()
-}
-
-fn make_keys(
-    k_mpint: &[u8],
-    h: &[u8],
-    sid: &[u8],
-    key_letter: u8,
-    iv_letter: u8,
-    kind: CipherKind,
-) -> Result<DirectionKeys> {
-    let mut key = vec![0u8; kind.key_len()];
-    let iv_need = if kind.iv_len() == 0 { 8 } else { kind.iv_len() };
-    let mut iv = vec![0u8; iv_need];
-    if kind.key_len() > 0 {
-        derive_block(k_mpint, h, sid, key_letter, &mut key);
-    }
-    derive_block(k_mpint, h, sid, iv_letter, &mut iv);
-    if kind.iv_len() == 0 {
-        iv.clear();
-    } else {
-        iv.truncate(kind.iv_len());
-    }
-    DirectionKeys::from_material(kind, &key, &iv)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{ClientConfig, ServerConfig};
-
-    fn xfer_limited(from: &mut Connection, to: &mut Connection, max: usize) -> bool {
-        let n = match from.peek_out() {
-            Some(c) if !c.is_empty() => c.len().min(max),
-            _ => return false,
-        };
-        let chunk = from.peek_out().unwrap()[..n].to_vec();
-        to.read_buf_mut().extend_from_slice(&chunk);
-        from.consume_out(n);
-        to.process_in().expect("process_in");
-        true
-    }
-
-    fn pump(a: &mut Connection, b: &mut Connection) {
-        pump_limited(a, b, usize::MAX);
-    }
-
-    fn pump_limited(a: &mut Connection, b: &mut Connection, max: usize) {
-        for _ in 0..200_000 {
-            let p1 = xfer_limited(a, b, max);
-            let p2 = xfer_limited(b, a, max);
-            if !p1 && !p2 {
-                return;
-            }
-        }
-        panic!("pump did not settle");
-    }
-
-    fn drain_server(s: &mut Connection) {
-        while let Some(ev) = s.pop_event() {
-            match ev {
-                Event::OpenSession { local_id } | Event::OpenDirectTcpIp { local_id, .. } => {
-                    s.confirm_open(local_id).unwrap();
-                }
-                Event::ChannelData { local_id } => {
-                    while let Some(data) = s.peek_inbound(local_id).map(|d| d.to_vec()) {
-                        let n = data.len();
-                        s.consume_inbound(local_id, n);
-                        s.send_data(local_id, &data).unwrap();
-                    }
-                }
-                Event::ChannelEof { local_id } => {
-                    s.send_eof(local_id).unwrap();
-                    s.send_close(local_id).unwrap();
-                }
-                Event::ChannelClose { local_id } => {
-                    let _ = s.send_close(local_id);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[test]
-    fn handshake_and_echo_channel() {
-        let scfg = Arc::new(ServerConfig::test_config());
-        let ccfg = Arc::new(ClientConfig::new("proxy", "proxy"));
-        let mut s = Connection::server(scfg);
-        let mut c = Connection::client(ccfg);
-        for _ in 0..200 {
-            pump(&mut s, &mut c);
-            drain_server(&mut s);
-            let mut done = false;
-            while let Some(ev) = c.pop_event() {
-                if matches!(ev, Event::HandshakeComplete { .. }) {
-                    done = true;
-                }
-            }
-            if done && s.authed() && c.authed() {
-                break;
-            }
-        }
-        assert!(s.authed() && c.authed(), "auth failed");
-
-        let id = c.open_direct_tcpip("example.com", 443).unwrap();
-        for _ in 0..50 {
-            pump(&mut s, &mut c);
-            drain_server(&mut s);
-            let mut confirmed = false;
-            while let Some(ev) = c.pop_event() {
-                if matches!(ev, Event::ChannelOpenConfirmation { local_id } if local_id == id) {
-                    confirmed = true;
-                }
-            }
-            if confirmed {
-                break;
-            }
-        }
-        assert!(c.channel_alive(id));
-
-        let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        assert_eq!(c.send_data(id, payload).unwrap(), payload.len());
-        let mut got = Vec::new();
-        for _ in 0..50 {
-            pump(&mut s, &mut c);
-            drain_server(&mut s);
-            while let Some(d) = c.peek_inbound(id).map(|x| x.to_vec()) {
-                let n = d.len();
-                c.consume_inbound(id, n);
-                got.extend_from_slice(&d);
-            }
-            if got == payload {
-                break;
-            }
-        }
-        assert_eq!(got, payload, "echo mismatch");
-    }
-
-    #[test]
-    fn rekey_during_echo() {
-        let mut scfg = ServerConfig::test_config();
-        scfg.rekey_after_bytes = 8 * 1024;
-        let mut ccfg = ClientConfig::new("proxy", "proxy");
-        ccfg.rekey_after_bytes = 8 * 1024;
-        let mut s = Connection::server(Arc::new(scfg));
-        let mut c = Connection::client(Arc::new(ccfg));
-        for _ in 0..200 {
-            pump(&mut s, &mut c);
-            drain_server(&mut s);
-            if s.authed() && c.authed() {
-                break;
-            }
-        }
-        assert!(s.authed() && c.authed());
-        let id = c.open_direct_tcpip("example.com", 443).unwrap();
-        for _ in 0..50 {
-            pump(&mut s, &mut c);
-            drain_server(&mut s);
-            if c.outbound_allowance(id) > 0 {
-                break;
-            }
-            while c.pop_event().is_some() {}
-        }
-        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-        let mut sent = 0usize;
-        let mut got = Vec::new();
-        for _ in 0..5000 {
-            if sent < payload.len() {
-                sent += c.send_data(id, &payload[sent..]).unwrap();
-            }
-            pump(&mut s, &mut c);
-            drain_server(&mut s);
-            while let Some(d) = c.peek_inbound(id).map(|x| x.to_vec()) {
-                let n = d.len();
-                c.consume_inbound(id, n);
-                got.extend_from_slice(&d);
-            }
-            while c.pop_event().is_some() {}
-            if sent == payload.len() && got.len() == payload.len() {
-                break;
-            }
-        }
-        assert_eq!(
-            got,
-            payload,
-            "rekey echo mismatch {} vs {}",
-            got.len(),
-            payload.len()
-        );
-    }
-
-    #[test]
-    fn rekey_during_echo_bytewise() {
-        let mut scfg = ServerConfig::test_config();
-        scfg.rekey_after_bytes = 4 * 1024;
-        let mut ccfg = ClientConfig::new("proxy", "proxy");
-        ccfg.rekey_after_bytes = 4 * 1024;
-        let mut s = Connection::server(Arc::new(scfg));
-        let mut c = Connection::client(Arc::new(ccfg));
-        for _ in 0..400 {
-            pump_limited(&mut s, &mut c, 3);
-            drain_server(&mut s);
-            if s.authed() && c.authed() {
-                break;
-            }
-        }
-        assert!(s.authed() && c.authed());
-        let id = c.open_direct_tcpip("example.com", 443).unwrap();
-        for _ in 0..200 {
-            pump_limited(&mut s, &mut c, 3);
-            drain_server(&mut s);
-            if c.outbound_allowance(id) > 0 {
-                break;
-            }
-            while c.pop_event().is_some() {}
-        }
-        let payload: Vec<u8> = (0..24 * 1024).map(|i| (i % 251) as u8).collect();
-        let mut sent = 0usize;
-        let mut got = Vec::new();
-        for _ in 0..200_000 {
-            if sent < payload.len() {
-                sent += c.send_data(id, &payload[sent..]).unwrap();
-            }
-            pump_limited(&mut s, &mut c, 3);
-            drain_server(&mut s);
-            while let Some(d) = c.peek_inbound(id).map(|x| x.to_vec()) {
-                let n = d.len();
-                c.consume_inbound(id, n);
-                got.extend_from_slice(&d);
-            }
-            while c.pop_event().is_some() {}
-            if sent == payload.len() && got.len() == payload.len() {
-                break;
-            }
-        }
-        assert_eq!(
-            got,
-            payload,
-            "bytewise rekey echo {} vs {}",
-            got.len(),
-            payload.len()
-        );
-    }
+    buf.extend_from_slice(k);
+    hash.digest_parts(&[&buf])
 }

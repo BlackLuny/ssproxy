@@ -1,8 +1,8 @@
 [package]
 name = "ssproxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "High-performance sans-IO SSH TCP-proxy daemon (password auth)"
+description = "Embeddable, poll-driven SSH server/client with direct-tcpip streams"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.83"
 
@@ -12,30 +12,51 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "ssproxyd"
-path = "src/main.rs"
+path = "src/bin/ssproxyd.rs"
+required-features = ["bin"]
+
+[features]
+default = ["pubkey", "ecdh", "mlkem"]
+# Public-key user auth and OpenSSH PEM host keys (via ssh-key).
+pubkey = ["dep:ssh-key", "dep:ssh-encoding", "dep:signature"]
+# ecdh-sha2-nistp256/384/521 key exchange.
+ecdh = ["dep:p256", "dep:p384", "dep:p521"]
+# mlkem768x25519-sha256 hybrid post-quantum key exchange.
+mlkem = ["dep:ml-kem"]
+bin = ["dep:clap", "dep:env_logger", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net"]
 
 [dependencies]
+aes = "0.8"
 aes-gcm = { version = "0.10", features = ["aes"] }
 bytes = "1"
 chacha20 = "0.9"
-clap = { version = "4", features = ["derive"] }
+ctr = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core", "std"] }
-libc = "0.2"
+hmac = "0.12"
+log = "0.4"
+parking_lot = "0.12"
 poly1305 = "0.8"
 rand = "0.8"
 sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util", "signal"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+tokio = { version = "1", default-features = false, features = ["time", "sync", "io-util", "macros"] }
+x25519-dalek = "2"
+
+ssh-key = { version = "0.6", optional = true, default-features = false, features = ["std", "ed25519", "rsa", "p256", "p384", "p521"] }
+ssh-encoding = { version = "0.2", optional = true }
+signature = { version = "2", optional = true, default-features = false, features = ["std"] }
+p256 = { version = "0.13", optional = true, default-features = false, features = ["ecdh", "std"] }
+p384 = { version = "0.13", optional = true, default-features = false, features = ["ecdh", "std"] }
+p521 = { version = "0.13", optional = true, default-features = false, features = ["ecdh", "std"] }
+ml-kem = { version = "0.3.2", optional = true, default-features = false }
+
+clap = { version = "4", optional = true, features = ["derive"] }
+env_logger = { version = "0.11", optional = true }
 
 [dev-dependencies]
-hex = "0.4"
-libc = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util", "process"] }
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util", "process", "test-util"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"

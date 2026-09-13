@@ -15,6 +15,7 @@ pub const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
 pub const SSH_MSG_USERAUTH_FAILURE: u8 = 51;
 pub const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
 pub const SSH_MSG_USERAUTH_BANNER: u8 = 53;
+pub const SSH_MSG_USERAUTH_PK_OK: u8 = 60;
 pub const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
 pub const SSH_MSG_REQUEST_SUCCESS: u8 = 81;
 pub const SSH_MSG_REQUEST_FAILURE: u8 = 82;
@@ -32,20 +33,15 @@ pub const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
 pub const SSH_MSG_PING: u8 = 192;
 pub const SSH_MSG_PONG: u8 = 193;
 
-pub const SSH_DISCONNECT_HOST_NOT_ALLOWED_TO_CONNECT: u32 = 1;
 pub const SSH_DISCONNECT_PROTOCOL_ERROR: u32 = 2;
 pub const SSH_DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3;
 pub const SSH_DISCONNECT_MAC_ERROR: u32 = 5;
-pub const SSH_DISCONNECT_COMPRESSION_ERROR: u32 = 6;
 pub const SSH_DISCONNECT_SERVICE_NOT_AVAILABLE: u32 = 7;
 pub const SSH_DISCONNECT_PROTOCOL_VERSION_NOT_SUPPORTED: u32 = 8;
-pub const SSH_DISCONNECT_HOST_KEY_NOT_VERIFIABLE: u32 = 9;
 pub const SSH_DISCONNECT_CONNECTION_LOST: u32 = 10;
 pub const SSH_DISCONNECT_BY_APPLICATION: u32 = 11;
 pub const SSH_DISCONNECT_TOO_MANY_CONNECTIONS: u32 = 12;
-pub const SSH_DISCONNECT_AUTH_CANCELLED_BY_USER: u32 = 13;
 pub const SSH_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE: u32 = 14;
-pub const SSH_DISCONNECT_ILLEGAL_USER_NAME: u32 = 15;
 
 pub const SSH_OPEN_ADMINISTRATIVELY_PROHIBITED: u32 = 1;
 pub const SSH_OPEN_CONNECT_FAILED: u32 = 2;
@@ -57,10 +53,13 @@ pub const KEX_STRICT_S: &str = "kex-strict-s-v00@openssh.com";
 pub const EXT_INFO_C: &str = "ext-info-c";
 pub const EXT_INFO_S: &str = "ext-info-s";
 
+#[inline]
 pub fn is_kex_msg(t: u8) -> bool {
     matches!(t, SSH_MSG_KEXINIT | SSH_MSG_NEWKEYS | 30..=49)
 }
 
-pub fn is_transport_ignore(t: u8) -> bool {
-    matches!(t, SSH_MSG_IGNORE | SSH_MSG_DEBUG | SSH_MSG_UNIMPLEMENTED)
+/// Messages allowed while a key exchange blocks the connection layer.
+#[inline]
+pub fn allowed_during_kex(t: u8) -> bool {
+    matches!(t, 1..=4 | SSH_MSG_KEXINIT | SSH_MSG_NEWKEYS | 30..=49)
 }
