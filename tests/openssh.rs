@@ -194,6 +194,19 @@ async fn openssh_each_cipher_and_kex() {
         .unwrap_or_else(|_| panic!("cipher timeout {c}"));
         assert_eq!(got.as_slice(), payload, "cipher {c}");
     }
+    // CTR with a classic (non-ETM) MAC: the length field is inside the
+    // ciphertext, so the head is decrypted separately and the keystream must
+    // continue exactly where it left off. A large payload spans many packets.
+    let big: Vec<u8> = (0..300 * 1024).map(|i| (i % 253) as u8).collect();
+    for m in ["hmac-sha2-256", "hmac-sha2-512", "hmac-sha2-512-etm@openssh.com"] {
+        let got = tokio::time::timeout(
+            Duration::from_secs(20),
+            ssh_forward(port, &target, &["-c", "aes128-ctr", "-m", m], &big, big.len()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("mac timeout {m}"));
+        assert_eq!(got, big, "aes128-ctr + {m}");
+    }
     for k in kexes {
         let got = tokio::time::timeout(
             Duration::from_secs(15),

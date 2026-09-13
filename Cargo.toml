@@ -26,15 +26,12 @@ mlkem = ["dep:ml-kem"]
 bin = ["dep:clap", "dep:env_logger", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net"]
 
 [dependencies]
-aes = "0.8"
 bytes = "1"
 # chacha20-poly1305@openssh.com 的实现。aws-lc-rs 自带 OpenSSH 那个变体
 # (aead::chacha20_poly1305_openssh)，汇编优化，且 **zfc 树里本来就有这一份**
 # (russh 默认 backend 就是它，rustls 也拉它) —— 不引入新依赖。
 aws-lc-rs = "1.16"
-ctr = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core", "std"] }
-hmac = "0.12"
 log = "0.4"
 parking_lot = "0.12"
 rand = "0.8"

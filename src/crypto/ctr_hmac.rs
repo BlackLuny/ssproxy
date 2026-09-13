@@ -1,8 +1,19 @@
-use aes::{Aes128, Aes192, Aes256};
-use ctr::cipher::{KeyIvInit, StreamCipher};
-use ctr::Ctr128BE;
-use hmac::{Hmac, Mac};
-use sha2::{Sha256, Sha512};
+//! `aes*-ctr` with `hmac-sha2-*` (classic or encrypt-then-MAC), on aws-lc.
+//!
+//! Measured on the real rig before this: the RustCrypto `ctr`+`hmac` path
+//! cost the worker 10.0 ns/byte (aes128-ctr, 888 Mbps) against 3.3 ns/byte
+//! for chacha20-poly1305 on aws-lc. Same library as the AEAD paths now.
+//!
+//! SSH CTR is one continuous counter stream across packets. aws-lc's one-shot
+//! CTR takes an explicit IV per call, so the running counter is kept here and
+//! advanced by the number of blocks each call consumed; every encrypted span
+//! is block-aligned (the padding rule guarantees it), so no keystream is ever
+//! split inside a block.
+
+use aws_lc_rs::cipher::{EncryptingKey, EncryptionContext, UnboundCipherKey, AES_128, AES_192, AES_256};
+use aws_lc_rs::constant_time::verify_slices_are_equal;
+use aws_lc_rs::hmac;
+use aws_lc_rs::iv::FixedLength;
 
 use crate::crypto::CipherKind;
 use crate::error::{Error, Result};
@@ -47,32 +58,52 @@ impl MacKind {
     }
 }
 
-enum Stream {
-    A128(Ctr128BE<Aes128>),
-    A192(Ctr128BE<Aes192>),
-    A256(Ctr128BE<Aes256>),
+/// One direction's keystream. CTR encrypt and decrypt are the same XOR, so a
+/// single encrypting key serves both; the running block counter lives here.
+struct Stream {
+    enc: EncryptingKey,
+    counter: [u8; 16],
 }
 
 impl Stream {
-    #[inline]
-    fn apply(&mut self, data: &mut [u8]) {
-        match self {
-            Self::A128(c) => c.apply_keystream(data),
-            Self::A192(c) => c.apply_keystream(data),
-            Self::A256(c) => c.apply_keystream(data),
-        }
+    fn new(cipher: CipherKind, key: &[u8], iv: &[u8]) -> Result<Self> {
+        let alg = match cipher {
+            CipherKind::Aes128Ctr => &AES_128,
+            CipherKind::Aes192Ctr => &AES_192,
+            CipherKind::Aes256Ctr => &AES_256,
+            _ => return Err(Error::Crypto("not ctr")),
+        };
+        let bad = |_| Error::Crypto("ctr key/iv");
+        let enc = EncryptingKey::ctr(UnboundCipherKey::new(alg, key).map_err(bad)?).map_err(bad)?;
+        let counter: [u8; 16] = iv.try_into().map_err(|_| Error::Crypto("ctr iv"))?;
+        Ok(Self { enc, counter })
     }
-}
 
-enum Keyed {
-    S256(Hmac<Sha256>),
-    S512(Hmac<Sha512>),
+    /// Advance the big-endian 128-bit block counter.
+    fn bump(&mut self, blocks: u64) {
+        let c = u128::from_be_bytes(self.counter).wrapping_add(blocks as u128);
+        self.counter = c.to_be_bytes();
+    }
+
+    #[inline]
+    fn apply(&mut self, data: &mut [u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(data.len() % 16, 0, "ctr span not block aligned");
+        let ctx = EncryptionContext::Iv128(FixedLength::from(self.counter));
+        self.enc
+            .less_safe_encrypt(data, ctx)
+            .map_err(|_| Error::Crypto("ctr"))?;
+        self.bump((data.len() / 16) as u64);
+        Ok(())
+    }
 }
 
 /// `aes*-ctr` with `hmac-sha2-*` (classic or encrypt-then-MAC).
 pub struct CtrHmac {
     stream: Stream,
-    mac: Keyed,
+    mac: hmac::Key,
     kind: MacKind,
     /// Non-ETM receive: bytes of the current packet already decrypted by
     /// `decrypt_head`.
@@ -81,24 +112,14 @@ pub struct CtrHmac {
 
 impl CtrHmac {
     pub fn new(cipher: CipherKind, mac: MacKind, key: &[u8], iv: &[u8], mac_key: &[u8]) -> Result<Self> {
-        let bad = |_| Error::Crypto("ctr key/iv");
-        let stream = match cipher {
-            CipherKind::Aes128Ctr => Stream::A128(Ctr128BE::new_from_slices(key, iv).map_err(bad)?),
-            CipherKind::Aes192Ctr => Stream::A192(Ctr128BE::new_from_slices(key, iv).map_err(bad)?),
-            CipherKind::Aes256Ctr => Stream::A256(Ctr128BE::new_from_slices(key, iv).map_err(bad)?),
-            _ => return Err(Error::Crypto("not ctr")),
-        };
-        let mac_state = match mac {
-            MacKind::HmacSha256 | MacKind::HmacSha256Etm => Keyed::S256(
-                Hmac::new_from_slice(mac_key).map_err(|_| Error::Crypto("mac key"))?,
-            ),
-            MacKind::HmacSha512 | MacKind::HmacSha512Etm => Keyed::S512(
-                Hmac::new_from_slice(mac_key).map_err(|_| Error::Crypto("mac key"))?,
-            ),
+        let stream = Stream::new(cipher, key, iv)?;
+        let alg = match mac {
+            MacKind::HmacSha256 | MacKind::HmacSha256Etm => hmac::HMAC_SHA256,
+            MacKind::HmacSha512 | MacKind::HmacSha512Etm => hmac::HMAC_SHA512,
         };
         Ok(Self {
             stream,
-            mac: mac_state,
+            mac: hmac::Key::new(alg, mac_key),
             kind: mac,
             head_done: 0,
         })
@@ -113,57 +134,39 @@ impl CtrHmac {
     }
 
     fn compute(&self, seq: u32, data: &[u8], out: &mut [u8]) {
-        match &self.mac {
-            Keyed::S256(m) => {
-                let mut m = m.clone();
-                m.update(&seq.to_be_bytes());
-                m.update(data);
-                out[..32].copy_from_slice(&m.finalize().into_bytes());
-            }
-            Keyed::S512(m) => {
-                let mut m = m.clone();
-                m.update(&seq.to_be_bytes());
-                m.update(data);
-                out[..64].copy_from_slice(&m.finalize().into_bytes());
-            }
-        }
+        let mut ctx = hmac::Context::with_key(&self.mac);
+        ctx.update(&seq.to_be_bytes());
+        ctx.update(data);
+        let tag = ctx.sign();
+        let n = self.mac_len();
+        out[..n].copy_from_slice(&tag.as_ref()[..n]);
     }
 
     fn verify(&self, seq: u32, data: &[u8], tag: &[u8]) -> Result<()> {
-        let ok = match &self.mac {
-            Keyed::S256(m) => {
-                let mut m = m.clone();
-                m.update(&seq.to_be_bytes());
-                m.update(data);
-                m.verify_slice(tag).is_ok()
-            }
-            Keyed::S512(m) => {
-                let mut m = m.clone();
-                m.update(&seq.to_be_bytes());
-                m.update(data);
-                m.verify_slice(tag).is_ok()
-            }
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(Error::Crypto("mac"))
+        let mut ctx = hmac::Context::with_key(&self.mac);
+        ctx.update(&seq.to_be_bytes());
+        ctx.update(data);
+        let ours = ctx.sign();
+        let n = self.mac_len();
+        if tag.len() < n {
+            return Err(Error::Crypto("mac"));
         }
+        verify_slices_are_equal(&ours.as_ref()[..n], &tag[..n]).map_err(|_| Error::Crypto("mac"))
     }
 
     /// Non-ETM: decrypt the first cipher block so the length is readable.
     pub fn decrypt_head(&mut self, head: &mut [u8]) {
-        self.stream.apply(head);
+        let _ = self.stream.apply(head);
         self.head_done = head.len();
     }
 
     pub fn seal(&mut self, seq: u32, pkt: &mut [u8], tag_out: &mut [u8]) -> Result<()> {
         if self.kind.etm() {
-            self.stream.apply(&mut pkt[4..]);
+            self.stream.apply(&mut pkt[4..])?;
             self.compute(seq, pkt, tag_out);
         } else {
             self.compute(seq, pkt, tag_out);
-            self.stream.apply(pkt);
+            self.stream.apply(pkt)?;
         }
         Ok(())
     }
@@ -171,11 +174,10 @@ impl CtrHmac {
     pub fn open(&mut self, seq: u32, pkt: &mut [u8], tag: &[u8]) -> Result<()> {
         if self.kind.etm() {
             self.verify(seq, pkt, tag)?;
-            self.stream.apply(&mut pkt[4..]);
-            Ok(())
+            self.stream.apply(&mut pkt[4..])
         } else {
             let done = std::mem::take(&mut self.head_done);
-            self.stream.apply(&mut pkt[done..]);
+            self.stream.apply(&mut pkt[done..])?;
             self.verify(seq, pkt, tag)
         }
     }
