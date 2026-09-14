@@ -123,12 +123,18 @@ where
         }
         Sink::Source(total) => {
             let buf = vec![0x5Au8; relay_buf];
+            // BENCH_FLUSH_EACH=1: flush after every write, like zfc's relay
+            // copy loop does (#585 only shows up with it).
+            let flush_each = std::env::var_os("BENCH_FLUSH_EACH").is_some();
             let mut written = 0usize;
             while written < total {
                 let want = relay_buf.min(total - written);
                 match s.write(&buf[..want]).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => written += n,
+                }
+                if flush_each && s.flush().await.is_err() {
+                    break;
                 }
             }
             let _ = s.flush().await;

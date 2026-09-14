@@ -483,6 +483,52 @@ async fn buffered_transport_flush_progress() {
     assert_eq!(got, payload);
 }
 
+/// `flush` must not wait for the driver to seal what `write` accepted (#585).
+/// Relays flush after every write; a flush that parks until the queue is
+/// sealed turns each relay read into its own small packet plus a relay↔driver
+/// round trip (download at ~0.6x). Here the session's output is stalled (the
+/// client stops reading), so a waiting flush never returns at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_does_not_wait_for_driver_to_seal() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (tx, mut rx) = mpsc::unbounded_channel::<IncomingChannel>();
+    tokio::spawn(async move {
+        let _ = driver::serve(server_io, server_cfg(), hooks(), tx).await;
+    });
+    let mut c = Client::connect(client_io, "proxy", "proxy").await;
+    let _id = c.open("h", 1).await;
+    // From here on the client never pumps: the server's output backs up past
+    // its soft limit and the driver stops sealing channel data.
+    let mut s = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("channel not delivered")
+        .expect("session ended")
+        .stream;
+
+    let chunk = vec![7u8; 8 * 1024];
+    let mut written = 0usize;
+    let mut blocked = false;
+    for _ in 0..4096 {
+        match tokio::time::timeout(Duration::from_millis(500), s.write(&chunk)).await {
+            Ok(Ok(n)) => written += n,
+            Ok(Err(e)) => panic!("write failed: {e}"),
+            Err(_) => {
+                blocked = true;
+                break;
+            }
+        }
+    }
+    assert!(blocked, "stream never applied backpressure ({written} bytes accepted)");
+    assert!(written > 0);
+
+    // Accepted bytes are still queued and cannot be sealed; flush returns anyway.
+    tokio::time::timeout(Duration::from_secs(1), s.flush())
+        .await
+        .expect("flush waited for the driver to seal the queue")
+        .expect("flush failed");
+    drop(c); // the session stays up (and the queue unsealed) until here
+}
+
 /// A channel whose reader never drains (its window fills, the echo backs up)
 /// must not delay a healthy channel on the same session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

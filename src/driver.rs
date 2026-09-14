@@ -609,9 +609,13 @@ fn pump_one(conn: &mut Connection, chans: &mut Chans, id: u32) {
                 s.wake_reader();
             }
         }
+        // The writer keeps appending while we seal: lend it the spare (empty
+        // unless a write overlapped last time) instead of a zero-capacity
+        // buffer it would have to regrow under the lock.
+        let spare = std::mem::take(&mut s.spare);
         (
             credited,
-            std::mem::take(&mut s.from_app),
+            std::mem::replace(&mut s.from_app, spare),
             s.from_app_fin,
             s.dropped,
         )
@@ -646,12 +650,20 @@ fn pump_one(conn: &mut Connection, chans: &mut Chans, id: u32) {
         let mut s = shared.lock();
         if s.from_app.is_empty() {
             // Nothing arrived meanwhile: hand the buffer (and its capacity)
-            // back, with any unsent tail still at the front.
+            // back, with any unsent tail still at the front. The lent buffer
+            // is released, so a channel without overlapping writes retains
+            // one buffer, as before.
             s.from_app = data;
-        } else if !data.is_empty() {
+        } else if data.is_empty() {
+            // The writer appended into the lent buffer and ours is drained:
+            // keep ours as the next spare rather than freeing it.
+            s.spare = data;
+        } else {
             // The writer appended while we were sealing; our tail precedes it.
             data.extend_from_slice(&s.from_app);
-            s.from_app = data;
+            let mut lent = std::mem::replace(&mut s.from_app, data);
+            lent.clear();
+            s.spare = lent;
         }
         if s.from_app.len() < s.tx_cap {
             s.wake_writer();

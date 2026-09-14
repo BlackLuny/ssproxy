@@ -64,6 +64,10 @@ pub(crate) struct ChanShared {
     pub starved: bool,
     /// Application → peer.
     pub from_app: BytesMut,
+    /// Emptied buffer the driver lends the writer while it seals `from_app`.
+    /// Only held after a write actually overlapped a seal, so the two buffers
+    /// alternate instead of being regrown and freed on every pump (#585).
+    pub spare: BytesMut,
     pub from_app_fin: bool,
     /// The stream handle was dropped.
     pub dropped: bool,
@@ -90,6 +94,7 @@ impl ChanShared {
             rx_cap,
             starved: false,
             from_app: BytesMut::new(),
+            spare: BytesMut::new(),
             from_app_fin: false,
             dropped: false,
             closed: false,
@@ -209,13 +214,17 @@ impl AsyncWrite for ChannelStream {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut s = self.shared.lock();
-        if s.closed || s.from_app.is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-        s.write_waker = Some(cx.waker().clone());
-        Poll::Pending
+    /// Ready at once: every accepted byte is already queued for the driver,
+    /// which was signalled by `poll_write`, and EOF/CLOSE wait for the queue
+    /// to drain, so nothing depends on a flush to be delivered.
+    ///
+    /// Waiting here until the driver had sealed the queue cost ~40% of
+    /// single-stream download throughput (#585): relays flush after every
+    /// write, so each relay read became its own small SSH packet plus a
+    /// relay↔driver round trip, and `tx_cap` never got to batch. Same
+    /// contract as russh's `ChannelTx`.
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
