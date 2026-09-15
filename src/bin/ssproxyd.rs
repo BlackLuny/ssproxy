@@ -37,7 +37,8 @@ fn load_host_key(path: &std::path::Path) -> HostKey {
         }
     }
     let key = HostKey::generate();
-    let hex: String = key.seed().iter().map(|b| format!("{b:02x}")).collect();
+    let seed = key.seed().expect("generated host key is ed25519");
+    let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
     let _ = std::fs::write(path, hex);
     key
 }

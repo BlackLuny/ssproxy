@@ -18,7 +18,7 @@ required-features = ["bin"]
 [features]
 default = ["pubkey", "ecdh", "mlkem"]
 # Public-key user auth and OpenSSH PEM host keys (via ssh-key).
-pubkey = ["dep:ssh-key", "dep:ssh-encoding", "dep:signature"]
+pubkey = ["dep:ssh-key", "dep:ssh-encoding", "dep:signature", "dep:rsa", "sha2/oid"]
 # ecdh-sha2-nistp256/384/521 key exchange.
 ecdh = ["dep:p256", "dep:p384", "dep:p521"]
 # mlkem768x25519-sha256 hybrid post-quantum key exchange.
@@ -41,7 +41,10 @@ x25519-dalek = "2"
 
 ssh-key = { version = "0.6", optional = true, default-features = false, features = ["std", "ed25519", "rsa", "p256", "p384", "p521"] }
 ssh-encoding = { version = "0.2", optional = true }
-signature = { version = "2", optional = true, default-features = false, features = ["std"] }
+signature = { version = "2", optional = true, default-features = false, features = ["std", "rand_core"] }
+# RSA host keys. Same 0.9 line ssh-key 0.6 already pulls in; named directly to
+# sign rsa-sha2-256 (ssh-key's own RSA signer is fixed to SHA-512).
+rsa = { version = "0.9", optional = true, default-features = false, features = ["std", "u64_digit"] }
 p256 = { version = "0.13", optional = true, default-features = false, features = ["ecdh", "std"] }
 p384 = { version = "0.13", optional = true, default-features = false, features = ["ecdh", "std"] }
 p521 = { version = "0.13", optional = true, default-features = false, features = ["ecdh", "std"] }

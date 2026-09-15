@@ -42,8 +42,20 @@ fn main() {
     let hk = HostKey::generate();
     let h = [7u8; 32];
     bench("hostkey sign (ed25519)", iters, || {
-        let _ = hk.sign(&h);
+        let _ = hk.sign(HostKey::ALGORITHM, &h).unwrap();
     });
+    for (pem, algo, n) in [
+        (include_str!("../tests/fixtures/hostkey_ecdsa256"), "ecdsa-sha2-nistp256", iters),
+        (include_str!("../tests/fixtures/hostkey_ecdsa384"), "ecdsa-sha2-nistp384", iters / 4),
+        (include_str!("../tests/fixtures/hostkey_ecdsa521"), "ecdsa-sha2-nistp521", iters / 10),
+        (include_str!("../tests/fixtures/hostkey_rsa2048"), "rsa-sha2-512", iters / 20),
+        (include_str!("../tests/fixtures/hostkey_rsa2048"), "rsa-sha2-256", iters / 20),
+    ] {
+        let hk = HostKey::from_openssh_pem(pem).unwrap();
+        bench(&format!("hostkey sign ({algo})"), n, || {
+            let _ = hk.sign(algo, &h).unwrap();
+        });
+    }
 
     let buf = [0u8; 1024];
     bench("sha256(1024B)", iters, || {

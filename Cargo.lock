@@ -1265,6 +1265,7 @@ dependencies = [
  "p521",
  "parking_lot",
  "rand",
+ "rsa",
  "sha2",
  "signature",
  "ssh-encoding",

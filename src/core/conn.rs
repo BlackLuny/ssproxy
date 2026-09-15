@@ -9,6 +9,7 @@ use crate::config::{ClientConfig, Config, ServerConfig};
 use crate::core::channel::{Channel, ChannelKind, ChannelTable};
 use crate::crypto::{padding_len, CipherKind, DirectionKeys, HashAlg, MacKind, MAX_PACKET};
 use crate::error::{Error, Result};
+use crate::hostkey::HostKey;
 use crate::kex::{self, ClientKex, KexAlgo};
 use crate::proto::msg::{self, KexInit};
 use crate::proto::*;
@@ -69,6 +70,8 @@ struct KexRun {
     mac_c2s: Option<MacKind>,
     mac_s2c: Option<MacKind>,
     hash: HashAlg,
+    /// Negotiated host key signature algorithm.
+    hostkey_algo: &'static str,
     theirs: Vec<u8>,
     client: Option<ClientKex>,
     /// Client role: our Q_C, needed for the exchange hash.
@@ -529,6 +532,15 @@ impl Connection {
 
     // ── KEXINIT / KEX ────────────────────────────────────────────────────────
 
+    /// Host key algorithms we offer: the server's key decides; the client
+    /// role only ever asks for ed25519.
+    fn our_hostkey_algorithms(&self) -> &'static [&'static str] {
+        match &self.server {
+            Some(s) => s.host_key.algorithms(),
+            None => &[HostKey::ALGORITHM],
+        }
+    }
+
     fn start_kex(&mut self) -> Result<()> {
         if self.sent_kexinit {
             return Ok(());
@@ -538,7 +550,7 @@ impl Connection {
         let kex: Vec<&str> = wire::names(&self.our_kex).collect();
         let ciphers: Vec<&str> = wire::names(&self.our_ciphers).collect();
         let macs: Vec<&str> = wire::names(&self.our_macs).collect();
-        let ours = msg::build_kexinit(cookie, &kex, &["ssh-ed25519"], &ciphers, &macs);
+        let ours = msg::build_kexinit(cookie, &kex, self.our_hostkey_algorithms(), &ciphers, &macs);
         self.kex = Some(KexRun {
             ours: ours.clone(),
             algo: KexAlgo::Curve25519Sha256,
@@ -547,6 +559,7 @@ impl Connection {
             mac_c2s: None,
             mac_s2c: None,
             hash: HashAlg::Sha256,
+            hostkey_algo: HostKey::ALGORITHM,
             theirs: Vec::new(),
             client: None,
             q_c: Vec::new(),
@@ -631,9 +644,16 @@ impl Connection {
             )
         };
 
-        if !theirs.has(msg::L_HOSTKEY, "ssh-ed25519") {
-            return Err(Error::protocol("no ssh-ed25519 host key"));
-        }
+        let our_hostkeys = self.our_hostkey_algorithms();
+        let our_hk = our_hostkeys.join(",");
+        let (hk_c, hk_s) = if is_server {
+            (theirs.list(msg::L_HOSTKEY).to_string(), our_hk)
+        } else {
+            (our_hk, theirs.list(msg::L_HOSTKEY).to_string())
+        };
+        let hostkey_algo = pick(&hk_c, &hk_s)
+            .and_then(|n| our_hostkeys.iter().copied().find(|a| *a == n))
+            .ok_or(Error::protocol("no common host key algorithm"))?;
         let algo = KexAlgo::from_name(&pick(&kex_c, &kex_s).ok_or(Error::protocol("no common kex"))?)
             .ok_or(Error::protocol("kex algo"))?;
         let cipher_c2s = CipherKind::from_name(
@@ -664,6 +684,7 @@ impl Connection {
         let run = self.kex.as_mut().ok_or(Error::protocol("kex state"))?;
         run.algo = algo;
         run.hash = algo.hash();
+        run.hostkey_algo = hostkey_algo;
         run.cipher_c2s = cipher_c2s;
         run.cipher_s2c = cipher_s2c;
         run.mac_c2s = mac_c2s;
@@ -692,6 +713,7 @@ impl Connection {
         let run = self.kex.as_ref().ok_or(Error::protocol("no kex"))?;
         let algo = run.algo;
         let hash = run.hash;
+        let hostkey_algo = run.hostkey_algo;
         let theirs = run.theirs.clone();
         let ours = run.ours.clone();
         let host = self.server.as_ref().ok_or(Error::protocol("no host key"))?.host_key.public_blob().to_vec();
@@ -699,7 +721,7 @@ impl Connection {
         let v_c = self.ident_peer.clone().ok_or(Error::protocol("no peer ident"))?;
         let v_s = self.ident_local.clone();
         let h = exchange_hash(hash, &v_c, &v_s, &theirs, &ours, &host, &q_c, &q_s, &k);
-        let sig = self.server.as_ref().unwrap().host_key.sign(&h);
+        let sig = self.server.as_ref().unwrap().host_key.sign(hostkey_algo, &h)?;
         self.peer_hostkey = Some(host.clone());
         self.derive_and_stage(hash, &k, &h)?;
         let mut reply = vec![SSH_MSG_KEX_ECDH_REPLY];

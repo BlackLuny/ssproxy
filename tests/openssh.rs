@@ -13,9 +13,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 
 async fn start_server(publickey: bool) -> u16 {
+    start_server_with(publickey, HostKey::generate()).await
+}
+
+async fn start_server_with(publickey: bool, host_key: HostKey) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let mut cfg = ServerConfig::new(HostKey::generate());
+    let mut cfg = ServerConfig::new(host_key);
     cfg.methods.publickey = publickey;
     let cfg = Arc::new(cfg);
     tokio::spawn(async move {
@@ -121,10 +125,20 @@ fn ssh_env(cmd: &mut Command) {
 }
 
 async fn ssh_forward(port: u16, target: &str, extra: &[&str], payload: &[u8], read_n: usize) -> Vec<u8> {
-    let mut args = ssh_base(port);
-    for e in extra {
-        args.push((*e).to_string());
-    }
+    try_ssh_forward(port, target, extra, payload, read_n).await.unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `extra` goes before the base options: OpenSSH keeps the *first* value of
+/// an `-o` option, so callers can override e.g. host key checking.
+async fn try_ssh_forward(
+    port: u16,
+    target: &str,
+    extra: &[&str],
+    payload: &[u8],
+    read_n: usize,
+) -> Result<Vec<u8>, String> {
+    let mut args: Vec<String> = extra.iter().map(|e| (*e).to_string()).collect();
+    args.extend(ssh_base(port));
     args.push("-W".into());
     args.push(target.into());
     args.push("proxy@127.0.0.1".into());
@@ -146,7 +160,7 @@ async fn ssh_forward(port: u16, target: &str, extra: &[&str], payload: &[u8], re
     match stdout.read_exact(&mut buf).await {
         Ok(_) => {
             let _ = child.kill().await;
-            buf
+            Ok(buf)
         }
         Err(e) => {
             let mut err = Vec::new();
@@ -154,9 +168,80 @@ async fn ssh_forward(port: u16, target: &str, extra: &[&str], payload: &[u8], re
                 let _ = es.read_to_end(&mut err).await;
             }
             let _ = child.kill().await;
-            panic!("ssh read: {e}; stderr={}", String::from_utf8_lossy(&err));
+            Err(format!("ssh read: {e}; stderr={}", String::from_utf8_lossy(&err)))
         }
     }
+}
+
+const HOSTKEYS: &[(&str, &str, &str)] = &[
+    ("ed25519", include_str!("fixtures/hostkey_ed25519"), include_str!("fixtures/hostkey_ed25519.pub")),
+    ("ecdsa256", include_str!("fixtures/hostkey_ecdsa256"), include_str!("fixtures/hostkey_ecdsa256.pub")),
+    ("ecdsa384", include_str!("fixtures/hostkey_ecdsa384"), include_str!("fixtures/hostkey_ecdsa384.pub")),
+    ("ecdsa521", include_str!("fixtures/hostkey_ecdsa521"), include_str!("fixtures/hostkey_ecdsa521.pub")),
+    ("rsa2048", include_str!("fixtures/hostkey_rsa2048"), include_str!("fixtures/hostkey_rsa2048.pub")),
+];
+
+/// Real OpenSSH client with `StrictHostKeyChecking=yes` against a known_hosts
+/// entry: the connection only succeeds if the client verified our host key
+/// signature for each negotiated algorithm. Negative cases: a pinned key of a
+/// different type, and a client that offers no algorithm the key can sign.
+#[tokio::test(flavor = "multi_thread")]
+async fn openssh_each_host_key_algorithm_pinned() {
+    let echo = spawn_echo().await;
+    let target = format!("{}:{}", echo.ip(), echo.port());
+    let payload = b"hostkey-pinned-ok";
+    let dir = std::env::temp_dir().join(format!("ssproxy-hostkey-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    for (name, pem, publine) in HOSTKEYS {
+        let hk = HostKey::from_openssh_pem(pem).unwrap();
+        let algos = hk.algorithms();
+        let port = start_server_with(false, hk).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let kh = dir.join(format!("known_hosts_{name}"));
+        std::fs::write(&kh, format!("[127.0.0.1]:{port} {}\n", publine.trim())).unwrap();
+        let kh_opt = format!("UserKnownHostsFile={}", kh.display());
+        for algo in algos {
+            let hka = format!("HostKeyAlgorithms={algo}");
+            let extra = ["-o", "StrictHostKeyChecking=yes", "-o", &kh_opt, "-o", &hka];
+            let got = tokio::time::timeout(
+                Duration::from_secs(20),
+                try_ssh_forward(port, &target, &extra, payload, payload.len()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name}/{algo}: timeout"))
+            .unwrap_or_else(|e| panic!("{name}/{algo}: {e}"));
+            assert_eq!(got.as_slice(), payload, "{name}/{algo}");
+        }
+
+        // Wrong pin: known_hosts holds another key type's public key.
+        let other = HOSTKEYS.iter().find(|(n, _, _)| n != name).unwrap().2;
+        let kh_bad = dir.join(format!("known_hosts_bad_{name}"));
+        std::fs::write(&kh_bad, format!("[127.0.0.1]:{port} {}\n", other.trim())).unwrap();
+        let kh_bad_opt = format!("UserKnownHostsFile={}", kh_bad.display());
+        let hka = format!("HostKeyAlgorithms={}", algos[0]);
+        let extra = ["-o", "StrictHostKeyChecking=yes", "-o", &kh_bad_opt, "-o", &hka];
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            try_ssh_forward(port, &target, &extra, payload, payload.len()),
+        )
+        .await
+        .expect("wrong-pin timeout");
+        assert!(r.is_err(), "{name}: wrong pinned key must fail");
+
+        // No common algorithm: fail closed, not silently fall back.
+        let unmatched = if *name == "ed25519" { "rsa-sha2-512" } else { "ssh-ed25519" };
+        let hka = format!("HostKeyAlgorithms={unmatched}");
+        let r = tokio::time::timeout(
+            Duration::from_secs(20),
+            try_ssh_forward(port, &target, &["-o", &hka], payload, payload.len()),
+        )
+        .await
+        .expect("no-common timeout");
+        assert!(r.is_err(), "{name}: no common host key algorithm must fail");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
