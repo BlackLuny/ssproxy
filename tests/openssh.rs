@@ -91,8 +91,15 @@ async fn spawn_echo() -> std::net::SocketAddr {
 }
 
 fn askpass() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("ssproxy-askpass-{}.sh", std::process::id()));
-    std::fs::write(&p, "#!/bin/sh\nexec printf '%s' 'proxy'\n").unwrap();
+    // Parallel OpenSSH tests must not rewrite a script while another ssh
+    // process executes it (Linux ETXTBSY). Give each invocation its own file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p = std::env::temp_dir().join(format!("ssproxy-askpass-{}-{seq}.sh", std::process::id()));
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p).unwrap();
+    f.write_all(b"#!/bin/sh\nexec printf '%s' 'proxy'\n").unwrap();
+    drop(f);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
