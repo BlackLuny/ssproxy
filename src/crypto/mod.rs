@@ -269,9 +269,14 @@ mod tests {
             let mk = vec![3u8; mac.map(|m| m.key_len()).unwrap_or(0)];
             let mut tx = DirectionKeys::new(kind, mac, &key, &iv, &mk).unwrap();
             let mut rx = DirectionKeys::new(kind, mac, &key, &iv, &mk).unwrap();
-            let mut pkt = vec![0u8; 4 + 32];
-            pkt[..4].copy_from_slice(&32u32.to_be_bytes());
-            pkt[4] = 10;
+            // Build a valid SSH packet for both classic CTR (encrypted
+            // length) and ETM (unencrypted length). Both must carry complete
+            // AES blocks before we corrupt the authentication tag.
+            let pad = padding_len(17, tx.block_size(), tx.length_is_aad());
+            let plen = 1 + 17 + pad;
+            let mut pkt = vec![0u8; 4 + plen];
+            pkt[..4].copy_from_slice(&(plen as u32).to_be_bytes());
+            pkt[4] = pad as u8;
             let mut tag = vec![0u8; tx.tag_len()];
             tx.seal(0, &mut pkt, &mut tag).unwrap();
             tag[0] ^= 1;
