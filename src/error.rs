@@ -7,10 +7,18 @@ pub enum Error {
     Protocol(&'static str),
     ProtocolFmt(String),
     Crypto(&'static str),
+    /// Authentication failed (client role) or too many failures (server role).
     Auth,
+    /// Peer sent SSH_MSG_DISCONNECT.
     Disconnect { reason: u32, message: String },
+    /// Channel open refused by the peer.
+    OpenFailed { reason: u32, message: String },
+    /// Transport closed by the peer.
     Closed,
-    TimedOut,
+    /// A session timer fired (preauth, idle, keepalive, kex).
+    TimedOut(&'static str),
+    /// Local shutdown requested through the session handle.
+    Shutdown,
 }
 
 impl Error {
@@ -20,6 +28,14 @@ impl Error {
 
     pub fn proto_fmt(msg: impl Into<String>) -> Self {
         Self::ProtocolFmt(msg.into())
+    }
+
+    /// `true` for endings that are normal operation rather than faults.
+    pub fn is_benign(&self) -> bool {
+        matches!(
+            self,
+            Self::Closed | Self::Shutdown | Self::Disconnect { .. } | Self::TimedOut("idle")
+        )
     }
 }
 
@@ -34,8 +50,12 @@ impl fmt::Display for Error {
             Self::Disconnect { reason, message } => {
                 write!(f, "disconnect ({reason}): {message}")
             }
+            Self::OpenFailed { reason, message } => {
+                write!(f, "channel open failed ({reason}): {message}")
+            }
             Self::Closed => write!(f, "connection closed"),
-            Self::TimedOut => write!(f, "timed out"),
+            Self::TimedOut(what) => write!(f, "{what} timeout"),
+            Self::Shutdown => write!(f, "shutdown"),
         }
     }
 }

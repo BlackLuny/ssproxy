@@ -1,56 +1,41 @@
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM};
 
 use crate::crypto::CipherKind;
 use crate::error::{Error, Result};
 
-#[allow(clippy::large_enum_variant)]
-enum Inner {
-    Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
-}
+const TAG: usize = 16;
 
-/// OpenSSH `aes128-gcm@openssh.com` / `aes256-gcm@openssh.com`.
+/// OpenSSH `aes{128,256}-gcm@openssh.com`, backed by aws-lc-rs (assembly, uses
+/// AES-NI/CLMUL where available) — the same backend russh uses and the one
+/// already present in the zfc dependency tree.
 ///
-/// Packet length is plaintext AAD. IV is 12 bytes; last 8 bytes increment per packet.
+/// Length is plaintext AAD; the 12-byte IV's low 8 bytes increment per packet
+/// (RFC 5647). We drive the nonce ourselves via `LessSafeKey` rather than
+/// aws-lc's `NonceSequence`: the sequence type increments all 12 bytes with
+/// carry, which is *not* the RFC 5647 rule, and keeping our own counter means
+/// the on-wire behaviour is unchanged by this swap.
+///
+/// `LessSafeKey` is "less safe" only because it lets the caller pick the nonce;
+/// that is exactly the requirement here, and uniqueness is guaranteed by the
+/// per-packet counter (a rekey installs fresh keys long before it could wrap).
 pub struct AesGcmSsh {
-    kind: CipherKind,
-    inner: Inner,
+    key: LessSafeKey,
     iv: [u8; 12],
 }
 
 impl AesGcmSsh {
     pub fn new(kind: CipherKind, key: &[u8], iv: &[u8]) -> Result<Self> {
-        if iv.len() != 12 {
-            return Err(Error::Crypto("aes-gcm iv"));
-        }
-        let mut iv_arr = [0u8; 12];
-        iv_arr.copy_from_slice(iv);
-        let inner = match kind {
-            CipherKind::Aes128Gcm => {
-                if key.len() != 16 {
-                    return Err(Error::Crypto("aes128 key"));
-                }
-                Inner::Aes128(Aes128Gcm::new(key.into()))
-            }
-            CipherKind::Aes256Gcm => {
-                if key.len() != 32 {
-                    return Err(Error::Crypto("aes256 key"));
-                }
-                Inner::Aes256(Aes256Gcm::new(key.into()))
-            }
+        let iv: [u8; 12] = iv.try_into().map_err(|_| Error::Crypto("gcm iv"))?;
+        let alg = match kind {
+            CipherKind::Aes128Gcm => &AES_128_GCM,
+            CipherKind::Aes256Gcm => &AES_256_GCM,
             _ => return Err(Error::Crypto("not aes-gcm")),
         };
+        let unbound = UnboundKey::new(alg, key).map_err(|_| Error::Crypto("aes-gcm key"))?;
         Ok(Self {
-            kind,
-            inner,
-            iv: iv_arr,
+            key: LessSafeKey::new(unbound),
+            iv,
         })
-    }
-
-    pub fn kind(&self) -> CipherKind {
-        self.kind
     }
 
     fn inc_iv(&mut self) {
@@ -62,63 +47,34 @@ impl AesGcmSsh {
         }
     }
 
-    pub fn seal(&mut self, _seq: u32, buf: &mut [u8], tag_out: &mut [u8]) -> Result<()> {
-        if buf.len() < 4 || tag_out.len() < 16 {
-            return Err(Error::Crypto("gcm seal buf"));
-        }
-        let (len_field, body) = buf.split_at_mut(4);
-        let tag = match &self.inner {
-            Inner::Aes128(c) => c
-                .encrypt_in_place_detached((&self.iv).into(), len_field, body)
-                .map_err(|_| Error::Crypto("gcm seal"))?,
-            Inner::Aes256(c) => c
-                .encrypt_in_place_detached((&self.iv).into(), len_field, body)
-                .map_err(|_| Error::Crypto("gcm seal"))?,
-        };
-        tag_out[..16].copy_from_slice(tag.as_slice());
+    pub fn seal(&mut self, _seq: u32, pkt: &mut [u8], tag_out: &mut [u8]) -> Result<()> {
+        let out = tag_out
+            .get_mut(..TAG)
+            .ok_or(Error::Crypto("gcm tag buffer"))?;
+        let nonce = Nonce::assume_unique_for_key(self.iv);
+        let (len_field, body) = pkt.split_at_mut(4);
+        // `len_field` is authenticated but not encrypted (OpenSSH GCM sends the
+        // packet length in the clear), so it goes in as AAD.
+        let aad: [u8; 4] = len_field.try_into().map_err(|_| Error::Crypto("gcm aad"))?;
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(nonce, Aad::from(&aad), body)
+            .map_err(|_| Error::Crypto("gcm seal"))?;
+        out.copy_from_slice(tag.as_ref());
         self.inc_iv();
         Ok(())
     }
 
-    pub fn open(&mut self, _seq: u32, buf: &mut [u8], tag: &[u8]) -> Result<()> {
-        if buf.len() < 4 || tag.len() != 16 {
-            return Err(Error::Crypto("gcm open buf"));
-        }
-        let (len_field, body) = buf.split_at_mut(4);
-        let tag_ga = GenericArray::from_slice(tag);
-        let r = match &self.inner {
-            Inner::Aes128(c) => {
-                c.decrypt_in_place_detached((&self.iv).into(), len_field, body, tag_ga)
-            }
-            Inner::Aes256(c) => {
-                c.decrypt_in_place_detached((&self.iv).into(), len_field, body, tag_ga)
-            }
-        };
-        r.map_err(|_| Error::Crypto("gcm tag"))?;
+    pub fn open(&mut self, _seq: u32, pkt: &mut [u8], tag: &[u8]) -> Result<()> {
+        let nonce = Nonce::assume_unique_for_key(self.iv);
+        let (len_field, body) = pkt.split_at_mut(4);
+        let aad: [u8; 4] = len_field.try_into().map_err(|_| Error::Crypto("gcm aad"))?;
+        self.key
+            .open_in_place_separate_tag(nonce, Aad::from(&aad), tag, body)
+            .map_err(|_| Error::Crypto("gcm tag"))?;
+        // Only advance on success: a rejected packet must not desynchronise the
+        // IV counter (the peer never counted it either).
         self.inc_iv();
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_aes256() {
-        let key = [7u8; 32];
-        let iv = [3u8; 12];
-        let mut a = AesGcmSsh::new(CipherKind::Aes256Gcm, &key, &iv).unwrap();
-        let mut b = AesGcmSsh::new(CipherKind::Aes256Gcm, &key, &iv).unwrap();
-        let mut buf = vec![
-            0, 0, 0, 16, 15, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        ];
-        let orig = buf.clone();
-        let mut tag = [0u8; 16];
-        a.seal(0, &mut buf, &mut tag).unwrap();
-        assert_eq!(&buf[..4], &orig[..4]);
-        assert_ne!(&buf[4..], &orig[4..]);
-        b.open(0, &mut buf, &tag).unwrap();
-        assert_eq!(buf, orig);
     }
 }

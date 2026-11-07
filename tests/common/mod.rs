@@ -1,502 +1,321 @@
+//! Shared harness for the integration tests: a driver-backed echo server on
+//! one end of a duplex pipe, a sans-IO client `Connection` pump on the other,
+//! and a sans-IO server core pump for tests that poke protocol state directly.
 #![allow(dead_code)]
 
-use std::future::poll_fn;
-use std::io::ErrorKind;
-use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::time::Duration;
 
 use ssproxy::config::{ClientConfig, ServerConfig};
 use ssproxy::core::{Connection, Event};
-use ssproxy::{serve, Result};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
+use ssproxy::driver::{self, AuthOutcome, Hooks, OpenOutcome};
+use ssproxy::hostkey::HostKey;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::mpsc;
 
-pub async fn start_server(cfg: ServerConfig) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(listener, Arc::new(cfg)).await;
-    });
-    addr
+pub fn server_cfg() -> Arc<ServerConfig> {
+    let mut cfg = ServerConfig::new(HostKey::generate());
+    cfg.methods.publickey = false;
+    Arc::new(cfg)
 }
 
-pub async fn spawn_echo() -> std::net::SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
+pub fn hooks() -> Hooks {
+    Hooks {
+        auth_password: Box::new(|u, p| {
+            if u == "proxy" && p == "proxy" {
+                AuthOutcome::Accept
+            } else {
+                AuthOutcome::Reject { delay: Duration::from_millis(10) }
+            }
+        }),
+        open: Box::new(|_, _, _| OpenOutcome::Accept),
+        ..Hooks::default()
+    }
+}
+
+/// Spawn the server driver on one end of a duplex pipe; echo every incoming
+/// channel back to itself. Returns the client end.
+pub fn spawn_server(cfg: Arc<ServerConfig>) -> DuplexStream {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (tx, mut rx) = mpsc::unbounded_channel::<driver::IncomingChannel>();
     tokio::spawn(async move {
-        loop {
-            let Ok((mut s, _)) = l.accept().await else {
-                break;
-            };
+        while let Some(ch) = rx.recv().await {
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 64 * 1024];
+                let mut s = ch.stream;
+                let mut buf = vec![0u8; 16 * 1024];
                 loop {
-                    let n = match s.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    if s.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-pub async fn spawn_http(body: &'static [u8]) -> std::net::SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut s, _)) = l.accept().await else {
-                break;
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                let _ = s.read(&mut buf).await;
-                let hdr = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = s.write_all(hdr.as_bytes()).await;
-                let _ = s.write_all(body).await;
-            });
-        }
-    });
-    addr
-}
-
-/// Flood *downstream* forever and never read. This is the russh RC2 dest:
-/// the server can still produce CHANNEL_DATA, but inbound (client→dest)
-/// fills the TCP window and then the SSH recv window.
-pub async fn spawn_flood_write_only() -> std::net::SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut s, _)) = l.accept().await else {
-                break;
-            };
-            let _ = s.set_nodelay(true);
-            tokio::spawn(async move {
-                let buf = vec![0xABu8; 8 * 1024];
-                loop {
-                    if s.write_all(&buf).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-/// Accept and hold sockets without reading or writing (pure inbound freeze).
-pub async fn spawn_freeze() -> std::net::SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move {
-        let mut held = Vec::new();
-        loop {
-            let Ok((s, _)) = l.accept().await else {
-                break;
-            };
-            held.push(s);
-        }
-    });
-    addr
-}
-
-/// Slow reader: accepts and reads 1 byte every `delay`.
-pub async fn spawn_trickle(delay: std::time::Duration) -> std::net::SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut s, _)) = l.accept().await else {
-                break;
-            };
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1];
-                loop {
-                    tokio::time::sleep(delay).await;
                     match s.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
+                let _ = s.shutdown().await;
             });
         }
     });
-    addr
+    tokio::spawn(async move {
+        if let Err(e) = driver::serve(server_io, cfg, hooks(), tx).await {
+            eprintln!("[test server] session ended: {e:?}");
+        }
+    });
+    client_io
 }
 
-pub fn askpass_script() -> PathBuf {
-    let p = std::env::temp_dir().join(format!("ssproxy-askpass-{}.sh", std::process::id()));
-    std::fs::write(&p, "#!/bin/sh\nexec printf '%s' 'proxy'\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+/// Minimal async pump for the sans-IO client `Connection`.
+/// Outcome of one pump round.
+#[derive(Debug, Clone, Copy)]
+pub enum Pump {
+    /// Bytes were read and processed.
+    Progress,
+    /// Nothing arrived this round; the peer may still be working.
+    Idle,
+    /// The connection is gone, for this reason.
+    Dead(&'static str),
+}
+
+impl Pump {
+    pub fn why(&self) -> &'static str {
+        match self {
+            Pump::Dead(why) => why,
+            Pump::Progress => "made progress",
+            Pump::Idle => "idle",
+        }
     }
-    p
 }
 
-pub struct ClientPump {
-    ssh: TcpStream,
+pub struct Client {
+    pub io: DuplexStream,
     pub conn: Connection,
-    ssh_tmp: Vec<u8>,
+    pub buf: Vec<u8>,
 }
 
-impl ClientPump {
-    pub fn new(ssh: TcpStream, cfg: ClientConfig) -> Self {
-        let _ = ssh.set_nodelay(true);
-        Self {
-            ssh,
-            conn: Connection::client(Arc::new(cfg)),
-            ssh_tmp: vec![0u8; 64 * 1024],
-        }
+impl Client {
+    pub async fn connect(io: DuplexStream, user: &str, pw: &str) -> Self {
+        let conn = Connection::client(Arc::new(ClientConfig::new(user, pw)));
+        let mut c = Self { io, conn, buf: vec![0u8; 32 * 1024] };
+        c.pump_until(|conn| conn.authed()).await;
+        c
     }
 
-    pub fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool>> {
-        let mut progress = false;
-        let mut pending = false;
-        #[allow(clippy::while_let_loop)]
+    pub async fn flush(&mut self) {
         loop {
-            let Some(chunk) = self.conn.peek_out() else {
-                break;
+            let res = {
+                let Some(chunk) = self.conn.peek_out() else { break };
+                self.io.write(chunk).await
             };
-            match Pin::new(&mut self.ssh).poll_write(cx, chunk) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(ssproxy::Error::Closed)),
-                Poll::Ready(Ok(n)) => {
-                    self.conn.consume_out(n);
-                    progress = true;
-                }
-                Poll::Ready(Err(e)) if e.kind() == ErrorKind::WouldBlock => {
-                    pending = true;
-                    break;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-                Poll::Pending => {
-                    pending = true;
-                    break;
-                }
+            match res {
+                Ok(n) if n > 0 => self.conn.consume_out(n),
+                _ => break,
             }
         }
-        let _ = Pin::new(&mut self.ssh).poll_flush(cx);
-        let mut rb = ReadBuf::new(&mut self.ssh_tmp);
-        let n = match Pin::new(&mut self.ssh).poll_read(cx, &mut rb) {
-            Poll::Ready(Ok(())) => rb.filled().len(),
-            Poll::Ready(Err(e)) if e.kind() == ErrorKind::WouldBlock => {
-                pending = true;
-                0
-            }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-            Poll::Pending => {
-                pending = true;
-                0
-            }
-        };
-        if n == 0 && pending && !progress && self.conn.peek_out().is_none() {
-            return Poll::Pending;
-        }
-        if n == 0 && !pending && !progress {
-            return Poll::Ready(Err(ssproxy::Error::Closed));
-        }
-        if n > 0 {
-            self.conn
-                .read_buf_mut()
-                .extend_from_slice(&self.ssh_tmp[..n]);
-            self.conn.process_in()?;
-            progress = true;
-            // Drain newly sealed packets before returning so WINDOW_ADJUST
-            // produced by later consume_inbound cannot be observed first.
-            #[allow(clippy::while_let_loop)]
-            loop {
-                let Some(chunk) = self.conn.peek_out() else {
-                    break;
-                };
-                match Pin::new(&mut self.ssh).poll_write(cx, chunk) {
-                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(ssproxy::Error::Closed)),
-                    Poll::Ready(Ok(wn)) => {
-                        self.conn.consume_out(wn);
-                        progress = true;
-                    }
-                    Poll::Ready(Err(e)) if e.kind() == ErrorKind::WouldBlock => break,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-                    Poll::Pending => break,
-                }
-            }
-        } else if !self.conn.read_buf_mut().is_empty() {
-            self.conn.process_in()?;
-        }
-        if pending && !progress {
-            return Poll::Pending;
-        }
-        Poll::Ready(Ok(progress))
+        let _ = self.io.flush().await;
     }
 
-    fn take_poll_io(&mut self, cx: &mut Context<'_>) -> Result<bool> {
-        match self.poll_io(cx) {
-            Poll::Ready(r) => r,
-            Poll::Pending => Ok(false),
+    pub async fn pump_once(&mut self) -> bool {
+        matches!(self.pump_round().await, Pump::Progress)
+    }
+
+    /// One round, distinguishing "the peer had nothing to say yet" from "the
+    /// connection is gone". A quiet round is normal under load; only the latter
+    /// ends a wait.
+    pub async fn pump_round(&mut self) -> Pump {
+        self.flush().await;
+        match tokio::time::timeout(Duration::from_millis(200), self.io.read(&mut self.buf)).await {
+            Ok(Ok(0)) => Pump::Dead("peer closed"),
+            Ok(Err(_)) => Pump::Dead("read error"),
+            Err(_) => Pump::Idle,
+            Ok(Ok(n)) => {
+                self.conn.read_buf_mut().extend_from_slice(&self.buf[..n]);
+                match self.conn.process_in() {
+                    Ok(()) => {
+                        self.flush().await;
+                        Pump::Progress
+                    }
+                    Err(_) => Pump::Dead("protocol error"), // e.g. auth rejection
+                }
+            }
         }
     }
 
-    pub async fn wait_handshake(&mut self) -> Result<String> {
-        poll_fn(|cx| loop {
-            match self.poll_io(cx) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false)) | Poll::Pending => {
-                    while let Some(ev) = self.conn.pop_event() {
-                        if let Event::HandshakeComplete { user } = ev {
-                            return Poll::Ready(Ok(user));
-                        }
-                        if let Event::Disconnect { message, .. } = ev {
-                            return Poll::Ready(Err(ssproxy::Error::proto_fmt(message)));
-                        }
-                    }
-                    if self.conn.authed() {
-                        return Poll::Ready(Ok(String::new()));
-                    }
-                    return Poll::Pending;
-                }
+    /// Wait for `cond` while pumping. A round that reads nothing is *not* a
+    /// failure — under a loaded machine the peer can take longer than
+    /// `pump_once`'s read timeout to produce the next packet — so only the
+    /// deadline ends the wait.
+    pub async fn pump_until(&mut self, cond: impl Fn(&Connection) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut last = Pump::Idle;
+        for _ in 0..2000 {
+            if cond(&self.conn) {
+                return;
             }
-            while let Some(ev) = self.conn.pop_event() {
-                if let Event::HandshakeComplete { user } = ev {
-                    return Poll::Ready(Ok(user));
-                }
-                if let Event::Disconnect { message, .. } = ev {
-                    return Poll::Ready(Err(ssproxy::Error::proto_fmt(message)));
-                }
+            if std::time::Instant::now() > deadline {
+                break;
             }
-            if self.conn.authed() {
-                return Poll::Ready(Ok(String::new()));
+            last = self.pump_round().await;
+            if matches!(last, Pump::Dead(_)) {
+                break;
             }
+        }
+        assert!(
+            cond(&self.conn),
+            "condition not reached (last round: {}, authed={}, peer={:?})",
+            last.why(),
+            self.conn.authed(),
+            self.conn.peer_ident(),
+        );
+    }
+
+    pub async fn open(&mut self, host: &str, port: u16) -> u32 {
+        let id = self.conn.open_direct_tcpip(host, port).unwrap();
+        // Wait for the open to be *answered*. The channel may already be past
+        // its confirmation: a peer that writes and closes immediately can land
+        // CONFIRMATION, DATA and CLOSE in one read, leaving no send credit to
+        // wait for while the channel is still delivering what it buffered.
+        self.pump_until(|c| {
+            c.send_capacity(id) > 0 || c.channel_got_eof(id) || !c.channel_alive(id)
         })
-        .await
-    }
-
-    pub async fn wait_channel_up(&mut self, id: u32) -> Result<()> {
-        poll_fn(|cx| loop {
-            match self.poll_io(cx) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false)) | Poll::Pending => {
-                    while let Some(ev) = self.conn.pop_event() {
-                        match ev {
-                            Event::ChannelOpenConfirmation { local_id } if local_id == id => {
-                                return Poll::Ready(Ok(()));
-                            }
-                            Event::ChannelOpenFailure {
-                                local_id, message, ..
-                            } if local_id == id => {
-                                return Poll::Ready(Err(ssproxy::Error::proto_fmt(message)));
-                            }
-                            Event::Disconnect { message, .. } => {
-                                return Poll::Ready(Err(ssproxy::Error::proto_fmt(message)));
-                            }
-                            _ => {}
-                        }
-                    }
-                    if self.conn.outbound_allowance(id) > 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    return Poll::Pending;
-                }
-            }
-            while let Some(ev) = self.conn.pop_event() {
-                match ev {
-                    Event::ChannelOpenConfirmation { local_id } if local_id == id => {
-                        return Poll::Ready(Ok(()));
-                    }
-                    Event::ChannelOpenFailure {
-                        local_id, message, ..
-                    } if local_id == id => {
-                        return Poll::Ready(Err(ssproxy::Error::proto_fmt(message)));
-                    }
-                    _ => {}
-                }
-            }
-            if self.conn.outbound_allowance(id) > 0 {
-                return Poll::Ready(Ok(()));
-            }
-        })
-        .await
-    }
-
-    pub async fn flush_out(&mut self) -> Result<()> {
-        poll_fn(|cx| loop {
-            match self.poll_io(cx) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(true)) => {
-                    if self.conn.peek_out().is_none() {
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                Poll::Ready(Ok(false)) | Poll::Pending => {
-                    if self.conn.peek_out().is_none() {
-                        return Poll::Ready(Ok(()));
-                    }
-                    return Poll::Pending;
-                }
-            }
-        })
-        .await
-    }
-
-    pub async fn write_all(&mut self, id: u32, mut data: &[u8]) -> Result<()> {
-        while !data.is_empty() {
-            let n = poll_fn(|cx| loop {
-                match self.poll_io(cx) {
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(true)) => {}
-                    Poll::Ready(Ok(false)) | Poll::Pending => {
-                        let allow = self.conn.outbound_allowance(id);
-                        if allow == 0 {
-                            return Poll::Pending;
-                        }
-                        return match self.conn.send_data(id, &data[..data.len().min(allow)]) {
-                            Ok(n) => Poll::Ready(Ok(n)),
-                            Err(e) => Poll::Ready(Err(e)),
-                        };
-                    }
-                }
-                let allow = self.conn.outbound_allowance(id);
-                if allow > 0 {
-                    return match self.conn.send_data(id, &data[..data.len().min(allow)]) {
-                        Ok(n) => Poll::Ready(Ok(n)),
-                        Err(e) => Poll::Ready(Err(e)),
-                    };
-                }
-            })
-            .await?;
-            if n == 0 {
-                self.flush_out().await?;
-            } else {
-                data = &data[n..];
-            }
-        }
-        self.flush_out().await
-    }
-
-    pub async fn read_exact(&mut self, id: u32, n: usize) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(n);
-        poll_fn(|cx| loop {
-            match self.poll_io(cx) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(_)) | Poll::Pending => {}
-            }
-            while let Some(d) = self.conn.peek_inbound(id) {
-                let take = (n - out.len()).min(d.len());
-                out.extend_from_slice(&d[..take]);
-                self.conn.consume_inbound(id, take);
-                if out.len() == n {
-                    return Poll::Ready(Ok(()));
-                }
-            }
-            match self.poll_io(cx) {
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(true)) => continue,
-                Poll::Ready(Ok(false)) | Poll::Pending => return Poll::Pending,
-            }
-        })
-        .await?;
-        Ok(out)
-    }
-
-    pub async fn pump_for(&mut self, dur: std::time::Duration) {
-        let _ = tokio::time::timeout(
-            dur,
-            poll_fn(|cx| {
-                let _ = self.poll_io(cx);
-                Poll::<()>::Pending
-            }),
-        )
         .await;
+        assert!(self.conn.channel_alive(id), "channel refused");
+        id
     }
-}
 
-pub fn ssh_base_args(port: u16) -> Vec<String> {
-    vec![
-        "-o".into(),
-        "StrictHostKeyChecking=no".into(),
-        "-o".into(),
-        "UserKnownHostsFile=/dev/null".into(),
-        "-o".into(),
-        "PreferredAuthentications=password".into(),
-        "-o".into(),
-        "PubkeyAuthentication=no".into(),
-        "-o".into(),
-        "NumberOfPasswordPrompts=1".into(),
-        "-o".into(),
-        "IdentitiesOnly=yes".into(),
-        "-o".into(),
-        "KbdInteractiveAuthentication=no".into(),
-        "-p".into(),
-        port.to_string(),
-    ]
-}
-
-pub async fn ssh_env() -> Vec<(String, String)> {
-    let ask = askpass_script();
-    vec![
-        ("SSH_ASKPASS".into(), ask.display().to_string()),
-        ("SSH_ASKPASS_REQUIRE".into(), "force".into()),
-        ("DISPLAY".into(), ":0".into()),
-        ("SSH_AUTH_SOCK".into(), "".into()),
-    ]
-}
-
-pub async fn run_ssh_stdio(
-    ssh_port: u16,
-    target: &str,
-    extra: &[&str],
-    payload: &[u8],
-    read_n: usize,
-) -> Vec<u8> {
-    let mut args = ssh_base_args(ssh_port);
-    for e in extra {
-        args.push((*e).into());
-    }
-    args.push("-W".into());
-    args.push(target.into());
-    args.push("proxy@127.0.0.1".into());
-    let mut cmd = Command::new("ssh");
-    cmd.args(&args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    for (k, v) in ssh_env().await {
-        cmd.env(k, v);
-    }
-    let mut child = cmd.spawn().expect("spawn ssh");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(payload).await.unwrap();
-        let _ = stdin.shutdown().await;
-    }
-    let mut stdout = child.stdout.take().unwrap();
-    let mut buf = vec![0u8; read_n];
-    match stdout.read_exact(&mut buf).await {
-        Ok(_) => {
-            let _ = child.kill().await;
-            buf
-        }
-        Err(e) => {
-            let mut errb = Vec::new();
-            if let Some(mut es) = child.stderr.take() {
-                let _ = es.read_to_end(&mut errb).await;
+    pub async fn echo_roundtrip(&mut self, id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut sent = 0;
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        for _ in 0..100_000 {
+            if sent < payload.len() {
+                sent += self.conn.send_data(id, &payload[sent..]).unwrap();
             }
-            let _ = child.kill().await;
-            panic!("ssh stdout: {e}; stderr={}", String::from_utf8_lossy(&errb));
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            self.pump_once().await;
+            while let Some(d) = self.conn.inbound_front(id).map(|d| d.to_vec()) {
+                let n = d.len();
+                self.conn.consume_inbound(id, n);
+                got.extend_from_slice(&d);
+            }
+            while self.conn.pop_event().is_some() {}
+            if sent == payload.len() && got.len() == payload.len() {
+                break;
+            }
+        }
+        got
+    }
+}
+
+/// Server-side sans-IO core pump. The driver normally owns the `Connection`;
+/// this test pokes connection state directly, so it drives the core itself.
+pub struct ServerCore {
+    pub io: DuplexStream,
+    pub conn: Connection,
+    pub buf: Vec<u8>,
+    pub channel: Option<u32>,
+    /// Every channel accepted, in order.
+    pub channels: Vec<u32>,
+}
+
+impl ServerCore {
+    pub async fn pump(&mut self) -> bool {
+        loop {
+            let res = {
+                let Some(chunk) = self.conn.peek_out() else { break };
+                self.io.write(chunk).await
+            };
+            match res {
+                Ok(n) if n > 0 => self.conn.consume_out(n),
+                _ => break,
+            }
+        }
+        let _ = self.io.flush().await;
+        match tokio::time::timeout(Duration::from_millis(200), self.io.read(&mut self.buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return false,
+            Ok(Ok(n)) => {
+                self.conn.read_buf_mut().extend_from_slice(&self.buf[..n]);
+                if self.conn.process_in().is_err() {
+                    return false;
+                }
+            }
+        }
+        while let Some(ev) = self.conn.pop_event() {
+            match ev {
+                Event::AuthPassword { .. }
+                | Event::AuthPublicKeyProbe { .. }
+                | Event::AuthPublicKey { .. } => self.conn.resolve_auth(true).unwrap(),
+                Event::OpenDirectTcpIp { local_id, .. } => {
+                    self.conn.accept_channel(local_id).unwrap();
+                    self.channel = Some(local_id);
+                    self.channels.push(local_id);
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+}
+
+
+impl ServerCore {
+    pub fn new(io: DuplexStream, cfg: Arc<ServerConfig>) -> Self {
+        Self {
+            io,
+            conn: Connection::server(cfg),
+            buf: vec![0u8; 16 * 1024],
+            channel: None,
+            channels: Vec::new(),
         }
     }
+}
+
+/// One short write: move at most `max` of what `src` has sealed into `dst`'s
+/// read buffer. Returns the bytes moved.
+pub fn xfer_max(src: &mut Connection, dst: &mut Connection, max: usize) -> usize {
+    let n = {
+        let Some(chunk) = src.peek_out() else { return 0 };
+        let n = chunk.len().min(max);
+        dst.read_buf_mut().extend_from_slice(&chunk[..n]);
+        n
+    };
+    src.consume_out(n);
+    n
+}
+
+/// Move everything `src` has sealed into `dst`.
+pub fn xfer(src: &mut Connection, dst: &mut Connection) {
+    while xfer_max(src, dst, usize::MAX) > 0 {}
+}
+
+/// Exchange core <-> core until the client is authenticated and (if
+/// `want_open`) the client's channel is confirmed. Returns the server-side
+/// local id of the last accepted channel.
+pub fn core_handshake(c: &mut Connection, s: &mut Connection, want_open: bool) -> Option<u32> {
+    let mut sch = None;
+    for _ in 0..1000 {
+        if c.authed() && (!want_open || sch.is_some()) {
+            return sch;
+        }
+        xfer(c, s);
+        xfer(s, c);
+        s.process_in().unwrap();
+        c.process_in().unwrap();
+        while let Some(ev) = s.pop_event() {
+            match ev {
+                Event::AuthPassword { .. }
+                | Event::AuthPublicKeyProbe { .. }
+                | Event::AuthPublicKey { .. } => s.resolve_auth(true).unwrap(),
+                Event::OpenDirectTcpIp { local_id, .. } => {
+                    s.accept_channel(local_id).unwrap();
+                    sch = Some(local_id);
+                }
+                _ => {}
+            }
+        }
+        while c.pop_event().is_some() {}
+    }
+    panic!("core handshake did not converge");
 }
