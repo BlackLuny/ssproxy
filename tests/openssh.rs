@@ -299,7 +299,17 @@ async fn openssh_each_cipher_and_kex() {
         .unwrap_or_else(|_| panic!("mac timeout {m}"));
         assert_eq!(got, big, "aes128-ctr + {m}");
     }
+    // OpenSSH 9.2 does not yet advertise the ML-KEM hybrid KEX. Only
+    // attempt algorithms listed by the installed real ssh client; the
+    // library-level KEX agreement test still covers ML-KEM independently.
+    let supported_kex = Command::new("ssh").args(["-Q", "kex"]).output().await.unwrap();
+    assert!(supported_kex.status.success(), "ssh -Q kex failed");
+    let supported_kex = String::from_utf8(supported_kex.stdout).unwrap();
     for k in kexes {
+        if !supported_kex.lines().any(|name| name == k) {
+            eprintln!("skipping unsupported OpenSSH KEX {k}");
+            continue;
+        }
         let got = tokio::time::timeout(
             Duration::from_secs(15),
             ssh_forward(port, &target, &["-o", &format!("KexAlgorithms={k}")], payload, payload.len()),
